@@ -2,9 +2,10 @@
 
 import json
 from dataclasses import asdict, dataclass, field
-from typing import Literal
+from typing import Literal, get_args
 
 Tier = Literal["flash", "basic", "standard", "advanced"]
+TIERS = get_args(Tier)
 
 
 @dataclass(frozen=True)

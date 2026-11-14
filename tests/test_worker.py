@@ -73,7 +73,7 @@ def test_invalid_measurements_and_wrong_version_are_rejected(tmp_path):
                 "worker_id": uuid4().hex,
                 "model_revision": config.model_revision,
                 "mineru_version": version("mineru"),
-                "protocol_version": 2,
+                "protocol_version": 3,
             },
         ).json()
         headers = {

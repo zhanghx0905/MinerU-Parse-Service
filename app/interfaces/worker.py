@@ -4,10 +4,8 @@ import argparse
 import json
 import logging
 import os
-import signal
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import version
 from uuid import uuid4
 
@@ -41,11 +39,12 @@ class Worker:
         self.fatal_exit = fatal_exit
         self.max_run_seconds = float(os.getenv("WORKER_MAX_RUN_SECONDS", "6000"))
 
-    def claim(self):
+    def claim(self, min_priority=0):
         response = self.client.post(
             "/internal/worker/claim",
             json={
                 "worker_id": self.id,
+                "min_priority": min_priority,
                 "protocol_version": WORKER_PROTOCOL_VERSION,
                 "mineru_version": version("mineru"),
                 "model_revision": self.config.model_revision,
@@ -108,7 +107,7 @@ class Worker:
                 timeout=60,
             )
         except Exception as exc:
-            logger.warning("Task attempt failed: %s", type(exc).__name__)
+            logger.exception("Task attempt failed: job=%s type=%s", job_id, type(exc).__name__)
             if not lost.is_set():
                 try:
                     response = self.client.post(f"/internal/jobs/{job_id}/fail", headers=headers)
@@ -158,10 +157,10 @@ class Worker:
                 delay = attempt + 1
             lost.wait(delay)
 
-    def _slot(self):
+    def _slot(self, min_priority=0):
         while not self.stop.is_set():
             try:
-                job = self.claim()
+                job = self.claim(min_priority)
                 if job:
                     self.execute(job)
                     continue
@@ -170,13 +169,14 @@ class Worker:
             self.stop.wait(self.config.poll_seconds)
 
     def run(self):
+        if self.settings.parse_workers != 1:
+            raise ValueError(
+                "A worker process handles one document; use WorkerPool for concurrency"
+            )
         try:
             if self.settings.preload_models:
                 self.engine.warmup()
-            with ThreadPoolExecutor(max_workers=self.settings.parse_workers) as pool:
-                futures = [pool.submit(self._slot) for _ in range(self.settings.parse_workers)]
-                for future in futures:
-                    future.result()
+            self._slot(int(self.settings.priority_workers > 0))
         finally:
             self.client.close()
             self.engine.close()
@@ -188,10 +188,9 @@ def main():
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    worker = Worker(Settings.from_env(), QueueSettings.from_env())
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(signum, lambda *_args: worker.stop.set())
-    worker.run()
+    from app.interfaces.worker_pool import WorkerPool
+
+    WorkerPool(Settings.from_env(), QueueSettings.from_env()).run()
 
 
 if __name__ == "__main__":

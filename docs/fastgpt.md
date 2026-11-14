@@ -1,76 +1,91 @@
-# SDFastGPT PDF 接口契约
+# HTTP 与 FastGPT 接口
 
-本服务支持普通 `customPdfParse.url` 和 `DOCUMENT_PARSE_PROVIDER=sangfor` 的 PDF 调用。将 URL 配成可访问的 `http://服务地址:3888/v2/parse/file`；Sangfor 接管扩展名只配置 `pdf`，本服务不接收 Office 文档。
+服务只接收 PDF，输出 Markdown、原始页数和耗时。图片以 data URI 内嵌；不提供 Office 转换、向量化或 RAG 入库。
 
-## 请求和结果
+## 业务接口
+
+| 方法与路径 | 行为 |
+| --- | --- |
+| `POST /jobs` | 上传后返回 202、任务 ID、状态和结果地址 |
+| `GET /jobs/{id}` | 查询 queued / running / succeeded / failed 状态 |
+| `GET /jobs/{id}/result` | 未完成返回 202；成功返回解析结果；失败返回 409 |
+| `POST /v2/parse/file` | 通过同一队列等待结果，同步成功返回 200 |
+| `GET /health` | 存活与近期 worker 活动，不代表实时推理探测 |
+| `GET /stats` | 全局队列和解析速度快照 |
+| `GET /metrics` | Prometheus 指标 |
+
+`/jobs` 及持久查询需要 `SERVICE_MODE=queue`，默认 Compose 使用此模式。`inline` 兼容模式只提供进程内同步解析，不支持持久幂等键或优先级调度。
+
+两种 POST 均使用 multipart 的 `file` 字段上传 PDF，接受相同参数。
+
+| Query 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `tier` | `PARSE_TIER`，默认 standard | flash / basic / standard / advanced |
+| `priority` | 0 | 0 普通，1 高优；复用在途任务时只提升、不降低优先级 |
+| `encode_img` | true | 是否在 Markdown 中内嵌图片资源 |
+| `disable_cache` | false | 跳过内容缓存和在途去重；显式幂等键仍有效 |
+
+| Multipart 表单字段 | 默认值 | 输出规则 |
+| --- | --- | --- |
+| `keep_header_footer` | false | 删除或保留 SDK 标记的页眉、页脚及页码 |
+| `keep_appendix` | true | false 时移除已识别的附录章节，到下一同级或更高层级的非附录标题恢复正文 |
+| `image_analysis` | false | 清除或保留图片、印章块的识别正文；原图和图注由其他选项控制 |
+| `chart_analysis` | false | 清除或保留图表块的结构化正文；原图和图注由其他选项控制 |
+
+过滤作用于 SDK 结构化结果，附录边界依赖标题识别与层级。未识别成标题的内容不会按正文关键词删除。开关不会自动提升解析档位；`encode_img=false` 仍保留其他开关允许的正文、表格和公式。
+
+## 异步任务与幂等
 
 ```bash
-curl --fail-with-body --max-time 600 \
-  -F 'file=@example.pdf' \
-  -F 'keep_header_footer=false' \
-  -F 'keep_appendix=true' \
-  -F 'image_analysis=false' \
-  -F 'chart_analysis=false' \
-  'http://127.0.0.1:3888/v2/parse/file'
+curl --fail-with-body -H 'Idempotency-Key: request-001' -F 'file=@example.pdf' \
+  'http://127.0.0.1:3888/jobs?tier=standard&priority=1'
+# 使用响应中的 status_url 和 result_url 查询。
 ```
 
-这四个字段是 multipart 表单字段。`disable_cache`、`encode_img`、`tier` 保持原有 query 参数形式。`POST /jobs` 接受同样的表单和 query 参数。
+相同内容、输出选项、解析器及模型版本默认合并在途任务或复用结果。`Idempotency-Key` 为 1–128 个字符：同一键和指纹返回原任务，同一键用于不同输入返回 409。不同键可以共享一次解析。
 
-| 字段 | 默认值 | 输出规则 |
-| --- | --- | --- |
-| `keep_header_footer` | false | 保留或删除 SDK 标记的页眉、页脚及页码 |
-| `keep_appendix` | true | 关闭时移除已识别标题以“附录 / 附錄 / Appendix / Appendices”开头的章节，支持数字编号；到下一同级或更高层级的非附录标题恢复正文 |
-| `image_analysis` | false | 保留或清除图片及印章块的识别正文，保留原图资源和图注 |
-| `chart_analysis` | false | 保留或清除图表块的结构化识别正文，保留原图资源和图注 |
-| `encode_img` | true | 独立控制图片资源；关闭时保留其他开关允许的文字、表格和公式 |
+失败任务仍由原幂等键指向，直到任务保留期清理；需要重新提交时使用新键。若还需跳过内容复用，使用 `disable_cache=true`。当前没有取消或原任务 ID 重新排队接口。
 
-这些规则作用于 SDK 的结构化结果，不靠替换 Markdown 猜测章节。附录过滤依赖 SDK 的标题识别与层级；未识别成标题的内容不会按正文关键词删除。图片、图表识别是否产生内容仍受解析档位和模型能力约束，开关不自动提升档位。
+## 同步结果与超时
 
-成功响应为 HTTP 200：
+```bash
+curl --fail-with-body --max-time 600 -F 'file=@example.pdf' \
+  -F 'keep_header_footer=false' -F 'keep_appendix=true' \
+  -F 'image_analysis=false' -F 'chart_analysis=false' \
+  'http://127.0.0.1:3888/v2/parse/file?tier=standard&encode_img=true'
+```
+
+成功响应：
 
 ```json
 {"success":true,"message":"","markdown":"# Example","pages":2,"duration":1.23}
 ```
 
-`pages` 始终为原 PDF 页数，过滤附录不会减少计费页数。明确过滤后没有剩余内容时，允许空字符串 Markdown。图片以 data URI 内嵌，FastGPT 自行转存；调用端未提供图片转存配置时会删除 base64 图片，这是 FastGPT 的既有行为。
+`pages` 为原 PDF 页数；过滤附录不会减少它。过滤后允许空 Markdown。`duration` 单位为秒：同步接口计算服务端接收、校验、提交和等待的总时间；异步结果计算任务入队至完成的时间。
 
-所有输出选项参与缓存和在途合并，默认值显式传入或省略具有相同语义。
+默认 `REQUEST_TIMEOUT=540` 秒，同步等待扣除上传、校验和提交耗时。超时返回 504，并附 `id / status_url / result_url`、`Location` 和 `X-Task-ID`；已经入队的任务继续执行。调用方需要自行查询结果，网络断开不代表任务未提交；不明确的提交响应应使用相同幂等键重试。
+
+## 鉴权与 FastGPT
+
+设置 `PDF_API_KEY` 后，解析、提交、状态、结果和 `/stats` 请求需携带 `Authorization: Bearer <key>`。`/health` 和 `/metrics` 保持可读；密钥留空时公开业务接口不启用鉴权。
+
+FastGPT 的 `customPdfParse.url` 指向 `/v2/parse/file`，`customPdfParse.key` 使用相同的 `PDF_API_KEY`。`DOCUMENT_PARSE_PROVIDER=sangfor` 路径只将 `pdf` 扩展名交给本服务。调用方的私网地址、SSRF 和图片转存策略需要在调用方配置；图片未转存时的保留行为也由调用方决定。
+
+`WORKER_API_TOKEN` 仅保护 `/internal/` 的 worker 协调接口，与业务凭据独立。内部协议要求解析器版本、模型标识和 worker 协议一致，不供业务方提交解析请求。
 
 ## 错误响应
 
-失败响应保留非 2xx HTTP 状态，并统一提供 `success=false`、`error`、`message`、`detail`、`statusText`。验证错误也使用这一格式。
+失败保持非 2xx 状态，统一提供 `success=false`、`message / error / detail / statusText`，不向业务接口暴露堆栈。
 
-| `statusText` | 场景 |
-| --- | --- |
-| `pdfEncrypted` | 无法使用空密码打开的加密 PDF |
-| `pdfCorrupted` | 错误签名、损坏或无法读取的 PDF |
-| `unsupportedParseFileType` | 非 PDF 文件名 |
-| `invalidParseFile` | 空文档、参数错误、大小/页数/工作量超限、幂等输入冲突 |
-| `pdfParseFailed` | 解析失败、等待超时、容量不足或基础设施故障 |
+| HTTP | 场景 | 调用方处理 |
+| --- | --- | --- |
+| 400 | 非 PDF、损坏、加密或空文档 | 修正输入 |
+| 401 | 凭据缺失或错误 | 使用对应接口的凭据 |
+| 404 | 任务不存在或已清理 | 检查 ID 和保留期 |
+| 409 | 幂等键冲突，或读取失败任务的结果 | 更换逻辑请求键或处理解析失败 |
+| 413 | 文件大小、页数超限 | 调整输入或服务配置；默认最多 50 MiB、1000 页 |
+| 422 | 参数格式错误 | 修正参数 |
+| 503 | 上传、同步等待、传输或队列容量满 | 按 `Retry-After` 退避 |
+| 504 | 同步等待超时 | 使用响应中的任务地址继续查询 |
 
-容量不足仍返回 503 和 `Retry-After`。worker 对下载、完成提交的临时 429/502/503/504 和传输异常最多尝试三次，再进入任务重试；FastGPT 自身是否退避取决于调用端，服务端不能替它处理重试头。
-
-## 超时与幂等
-
-服务默认 `REQUEST_TIMEOUT=540` 秒，为 SDFastGPT 默认 600 秒 HTTP 超时保留余量。同步等待使用扣除上传、校验和提交耗时后的剩余预算；底层校验/存储操作本身不具备强制终止线程的能力。调整调用端超时时，应同步设置服务端预算并给网关、网络和响应传输留余量。
-
-已有 `.env` 不会自动改写。升级前将旧的 `REQUEST_TIMEOUT=6000` 改成合适的值；`WORKER_MAX_RUN_SECONDS` 独立保持 6000 秒，异步任务可以继续处理长文档。
-
-队列模式下，两种提交接口均支持 `Idempotency-Key`。同步等待超时返回 504，包含任务 `id / status_url / result_url`、`Location` 和 `X-Task-ID`；已提交任务继续执行。SDFastGPT 现有同步调用不会自动查询这些地址，需要其调用者另外处理恢复。`inline` 模式不提供持久幂等键，传入时明确返回 503。
-
-## 凭据与内部地址
-
-设置本服务的 `PDF_API_KEY` 后，将相同值填入 SDFastGPT 的 `customPdfParse.key`。公开解析、提交、状态、结果及 `/stats` 接口会校验 Bearer；`/health` 与 `/metrics` 保持可读。留空表示公开接口不启用鉴权。
-
-`WORKER_API_TOKEN` 仅用于内部 worker，不能替代公开接口密钥。鉴权在读取请求体、预留上传名额之前执行。
-
-普通自定义 PDF 路径使用 SDFastGPT 的 SSRF 检查客户端：生产环境会拒绝 loopback，启用 `CHECK_INTERNAL_IP` 还会拒绝私网。Sangfor 路径支持管理员配置的内部服务地址。部署时需按所选调用路径配置可访问且被调用端允许的地址。
-
-## 从 1.1 升级
-
-1. 暂停新提交，排空在途任务，备份 SQLite 和对象存储，再停止旧 worker 与 API。
-2. 构建并启动 1.2 API。首次打开数据库时将 schema 1 在事务中迁移到 schema 2，保留任务、结果、租约和幂等映射；失败时回滚迁移。
-3. 旧任务保存原有图片/图表识别策略；清除旧内容复用标记。旧幂等映射保留，输出版本变化后重复使用旧键可能返回 409，新逻辑请求使用新键。
-4. 启动同版本 worker。协议版本 2 必须传递解析选项；旧 worker 领取会返回 409，避免静默忽略配置。
-
-进程入口现为 `python -m app.interfaces.worker` 和 `python -m app.cli.queue`；网关为 `app.interfaces.gateway:app`。Compose 已更新这些入口。迁移后回退旧镜像需要恢复升级前备份。
+稳定诊断码包括 `pdfEncrypted`、`pdfCorrupted`、`unsupportedParseFileType`、`invalidParseFile`、`pdfParseFailed`。`PDF exceeds 1000 pages` 是入口 413 校验，不占用解析 worker；入队后的 `parse_error`、租约失效和存储错误见[调度与故障处理](scheduling.md#5-异常情况如何处理)。

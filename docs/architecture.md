@@ -1,6 +1,6 @@
 # 代码结构与阅读顺序
 
-这个服务有两个主要概念：**文档解析**决定一份 PDF 如何生成 Markdown，**任务调度**决定何时执行、由谁执行以及哪些结果可以发布。目录按 DDD 的职责边界组织，不引入通用仓储框架、事件总线或额外的依赖注入容器。
+这个服务有两个主要概念：**文档解析**决定一份 PDF 如何生成 Markdown，**任务调度**决定何时执行、由谁执行以及哪些结果可以发布。目录分为业务规则、应用流程、基础设施和外部接口，具体组件由 `main.py` 装配。
 
 ```text
 app/
@@ -8,7 +8,7 @@ app/
 ├── config.py                      # 环境变量与配置校验
 ├── domain/
 │   ├── parsing.py                 # ParseOptions、ParseOutput、文档校验失败
-│   └── jobs.py                    # 任务成本/优先级规则、调度失败
+│   └── jobs.py                    # 调度失败
 ├── application/
 │   ├── parsing.py                 # 进程内解析、并发合并和结果缓存
 │   ├── queue.py                   # 持久任务提交、等待、结果读取和清理流程
@@ -26,7 +26,8 @@ app/
 │       ├── observability.py       # 完成统计与队列/解析速度读模型
 │       └── runtime.py             # SQLite 运行库检查
 ├── interfaces/
-│   ├── worker.py                  # GPU worker 进程、HTTP 协议和独立续租
+│   ├── worker.py                  # 单文档解析进程、HTTP 协议和独立续租
+│   ├── worker_pool.py             # spawn 进程池、固定 VIP 角色与故障重启
 │   ├── gateway.py                 # vLLM 请求代理与副本选择
 │   └── http/
 │       ├── parsing.py             # FastGPT 表单、同步解析和异步提交
@@ -36,7 +37,7 @@ app/
 │       ├── errors.py              # HTTP 状态与 FastGPT 错误响应
 │       └── health.py              # 存活、全局队列快照和解析速度
 └── cli/
-    └── queue.py                   # 在线备份与队列容量管理
+    └── queue.py                   # SQLite 在线备份
 ```
 
 ## 从哪里开始读
@@ -46,8 +47,9 @@ app/
 3. [application/queue.py](../app/application/queue.py)：看完整的持久任务流程。
 4. [infrastructure/sqlite/jobs.py](../app/infrastructure/sqlite/jobs.py)：重点阅读 `submit → claim → heartbeat → complete / fail`。
 5. [interfaces/worker.py](../app/interfaces/worker.py)：理解 worker 执行和续租的并行关系。
-6. [infrastructure/mineru/rendering.py](../app/infrastructure/mineru/rendering.py)：看开关怎样影响最终内容。
-7. 最后阅读 `main.py`，理解上述具体组件如何装配。
+6. [interfaces/worker_pool.py](../app/interfaces/worker_pool.py)：看解析进程如何启动、分配 VIP 角色和重启。
+7. [infrastructure/mineru/rendering.py](../app/infrastructure/mineru/rendering.py)：看开关怎样影响最终内容。
+8. 最后阅读 `main.py`，理解上述具体组件如何装配。
 
 ## 边界与依赖
 

@@ -1,100 +1,132 @@
-# 调度运维与扩容
+# 部署、配置与运维
 
-调度器的任务流程、状态机、领取顺序、租约及异常处理见[调度器实现与异常处理](scheduling.md)。本文说明部署和运维操作，容量实测见[性能汇总](benchmark.md)。
+本页是部署命令和环境配置的入口。任务调度细节见[调度说明](scheduling.md)，接口参数见[HTTP 契约](fastgpt.md)。
 
-## 部署边界
+## 部署拓扑
 
-CPU API 协调任务，SQLite WAL 保存元数据，GPU worker 通过认证 HTTP 领取、续租和提交结果。SQLite 必须位于调度主机本地持久磁盘，不能让不同机器通过 NFS 直接打开同一个 WAL 文件。worker 可以跨机器扩容，不需要共享数据库文件或对象目录。
+| 模式 | Compose 文件 | worker / vLLM 容器 | 默认解析进程 / VIP |
+| --- | --- | --- | --- |
+| 单卡 | `compose.yaml` | 1 / 1 | 2 / 0 |
+| 双卡 | 再加 `compose.scale.yaml` | 2 / 2 | 4 / 0 |
+| 四卡 | 再加 `compose.quad.yaml` | 4 / 4 | 32 / 2 |
 
-同一调度主机可以启动多个 API 进程，共享同一个 SQLite 文件。WAL 仍然只有一个写入者，增加 API 进程不会增加 SQLite 写入并行度。当前调度端有单节点故障边界，没有跨节点多活或自动故障转移。
+所有模式另有 1 个 CPU API 和 1 个 VLM 网关。每个 worker 容器启动一个轻量监督进程，再用 `spawn` 启动解析子进程；每个子进程同时处理一份 PDF，独立持有本地模型和 SDK 锁。vLLM 服务按 GPU 运行，由这些解析进程共享。
 
-API 镜像编译并校验 SQLite 3.51.3，运行时版本检查见 [runtime.py](../app/infrastructure/sqlite/runtime.py)。不要用未通过此检查的系统 SQLite 代替部署镜像的运行库。
+SQLite 和对象存储只由 API 访问。数据库必须放在协调主机本地持久磁盘，不支持多主机通过 NFS 打开同一 WAL 文件。解析 worker 可以跨主机扩容；当前没有控制平面自动故障转移或自动扩缩容。
 
-## 扩容执行资源
-
-同一张 GPU 增加 worker 进程：
+## 初始化与启动
 
 ```bash
-docker compose up -d --scale mineru-worker=2
+python3 scripts/init_env.py
+# 编辑 .env，设置 GPU、端口、业务凭据等。已有配置不会被脚本改写。
+docker compose build
+docker compose run --rm --no-deps --entrypoint mineru-kit mineru-worker \
+  models download --tier standard --small-backend torch --vlm-engine vllm -s modelscope
+docker compose up -d
 ```
 
-增加第二张 GPU，分别启动两个 worker 进程：
+四卡启动与检查：
 
 ```bash
-GPU_ID=0 GPU_ID_B=1 docker compose -f compose.yaml -f compose.scale.yaml up -d \
-  --scale mineru-worker=2 --scale mineru-worker-b=2
+docker compose -f compose.yaml -f compose.scale.yaml -f compose.quad.yaml build
+docker compose -f compose.yaml -f compose.scale.yaml -f compose.quad.yaml up -d
+docker compose -f compose.yaml -f compose.scale.yaml -f compose.quad.yaml ps
 ```
 
-`GPU_ID` 在部署时指定设备，第二个解析单元通过覆盖配置替换 GPU 设备列表。`PARSE_WORKERS` 控制每个 worker 进程内的执行线程数，默认 2；它与容器副本数是两个维度。每张卡上的 worker 与 vLLM 共用资源，增加进程也会增加模型内存和争用，应依据吞吐、P95 和显存测量调整。
+使用同一组 `-f` 参数执行启动、配置检查和维护。四卡模式每个 worker 服务保持一个容器；额外使用 `--scale` 会同时放大解析进程数和 VIP 数。
 
-远端 worker 需要配置 `WORKER_API_URL`、`WORKER_API_TOKEN`、解析档位、模型位置和 VLM 服务地址；MinerU 版本与 `MODEL_REVISION` 必须与协调端一致。worker 不直接访问 SQLite，文件仍经过协调端中转。
+## 配置
 
-当前没有自动扩缩容控制器。队列长度、加权工作量和最老任务等待时间持续增长时，先判断执行资源、本地 SDK 阶段、推理副本还是控制平面受限。增加队列只允许更多任务等待，不会增加处理能力。
+配置只在进程启动时从环境变量读取，Compose 从 `.env` 注入。数据库保存任务和实际占用，不保存容量上限。修改 `.env` 后执行对应 Compose 配置的 `up -d` 重建受影响服务；`restart` 不会重新注入环境变量。
 
-## 调整准入预算
+### 解析与 GPU
 
-`MAX_PENDING`、`QUEUE_MAX_WORK`、`QUEUE_MAX_UPLOADS` 初值写入数据库，所有 API 进程启动时检查它们与配置一致。修改现有容量使用管理命令：
+| 变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| `GPU_ID` / `GPU_ID_B` / `GPU_ID_C` / `GPU_ID_D` | 0 / 1 / 2 / 3 | GPU 设备编号 |
+| `PARSE_WORKERS` | 2 | 单卡、双卡模式每个 worker 容器的解析进程数 |
+| `WORKERS_PER_GPU` | 8 | 四卡模式覆盖每卡解析进程数 |
+| `PRIORITY_WORKERS` | 0 | 单卡、双卡模式每容器的高优专用进程数，包含在 `PARSE_WORKERS` 中 |
+| `PARSE_TIER` | standard | 默认解析档位 |
+| `PRELOAD_MODELS` | true | 各解析子进程启动后先预热 |
+| `MINERU_CPU_NUM_THREADS` | 2 | 每个解析进程的 CPU 算子线程上限 |
+| `MINERU_MODEL_VLM_MAX_CONCURRENCY` | 8 | 每个解析进程的 VLM 客户端并发 |
+| `GPU_MEMORY_UTILIZATION` | 0.35 | vLLM 显存比例，本地模型还需额外显存 |
+| `MODEL_REVISION` | MinerU2.5-Pro-2605-1.2B | 参与指纹与 worker 校验的模型标识 |
+| `VLLM_IMAGE` | vllm/vllm-openai:v0.29.0 | GPU 基础与推理镜像 |
+| `MINERU_MODEL_SOURCE` / `SMALL_BACKEND` | modelscope / torch | 模型来源与本地模型后端 |
+
+四卡配置的高优专用进程数固定为 1/1/0/0。默认每卡 8 个进程，共 30 个通用进程和 2 个 VIP；改变 `WORKERS_PER_GPU` 不改变 VIP 总数。通用进程先领高优再领普通，高优专用进程没有高优任务时空闲，不中断正在执行的普通任务。
+
+增加进程会增加模型副本、内存、显存和请求并发。根据实际吞吐、排队和显存峰值调整；并发进程数不等于吞吐倍数。当前 API 和 worker 的 `/tmp` 使用容器磁盘及 Linux 页缓存，避免固定容量内存盘在并发渲染位图时耗尽。
+
+### API 与容量
+
+| 变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| `API_PORT` / `API_PROCESSES` | 3888 / 1 | 对外端口与 API 进程数 |
+| `PDF_API_KEY` | 空 | 业务接口的可选 Bearer 密钥 |
+| `WORKER_API_TOKEN` | 初始化脚本生成 | 内部 worker 接口凭据，队列模式必填 |
+| `MAX_PENDING` | 10000 | 全局 queued + running 总量 |
+| `QUEUE_MAX_UPLOADS` | 64 | 上传、校验、输入存储中的并发请求 |
+| `QUEUE_MAX_SYNC_WAITERS` | 64 | 同步 HTTP 在途请求 |
+| `QUEUE_MAX_TRANSFERS` | 64 | 结果下载及 worker 文件传输并发 |
+| `MAX_UPLOAD_BYTES` / `MAX_PAGES` | 52428800 / 1000 | 单份 PDF 大小、页数上限，超限返回 413 |
+| `REQUEST_TIMEOUT` | 540 | 同步请求总等待预算，不取消持久任务 |
+| `QUEUE_UPLOAD_SECONDS` / `QUEUE_TRANSFER_SECONDS` | 120 / 120 | 接收请求体与文件传输期限 |
+| `QUEUE_MAX_QUEUE_SECONDS` | 0 | 0 表示排队不过期；正数才启用队列超时 |
+| `QUEUE_MAX_ATTEMPTS` | 3 | 最大执行次数，包含首次 |
+| `QUEUE_LEASE_SECONDS` / `QUEUE_HEARTBEAT_SECONDS` | 60 / 10 | 租约与续期间隔；心跳小于租约的一半 |
+| `WORKER_MAX_RUN_SECONDS` | 6000 | 单个执行尝试的硬期限，超时退出该解析进程 |
+| `QUEUE_POLL_SECONDS` | 0.25 | 空闲领取与结果轮询间隔 |
+| `QUEUE_RETENTION_SECONDS` | 86400 | 终态任务、成功结果及失败输入保留期 |
+| `QUEUE_MAX_RESULT_BYTES` | 67108864 | 单份 Markdown 结果上限 |
+| `CACHE_BYTES` / `CACHE_TTL` | 134217728 / 3600 | 可复用结果的字节预算与有效期 |
+
+上传名额在输入持久化后释放，与队列积压量分开计数。降低容量不删除已有任务，只暂停超过上限时的新建任务。多个 API 进程使用同一份配置并一起重启。
+
+### 文件存储与远端 worker
+
+Compose 的 `QUEUE_DATABASE` 为 `/data/queue.sqlite3`，`OBJECT_DIR` 为 `/data/objects`，使用 `queue-data` 持久卷。直接运行 Python 时默认分别为 `data/queue.sqlite3`、`data/objects`。
+
+`OBJECT_STORAGE=local` 使用本地目录；设置为 `s3` 时配置 `S3_BUCKET`、可选 `S3_ENDPOINT_URL` 和标准 AWS 凭据。只有 API 访问对象存储，worker 始终经认证 HTTP 下载输入和提交结果。
+
+`MODEL_DIR` 未设置时使用 Compose 的 `models` 命名卷；也可指定模型所在的宿主机目录。远端 worker 需要 `WORKER_API_URL`、`WORKER_API_TOKEN`、模型目录、GPU 和 VLM 服务地址，并保持 MinerU 版本与 `MODEL_REVISION` 一致。直接运行的入口是 `python -m app.interfaces.worker`。
+
+## 更新与停止
+
+代码更新先构建镜像，再重建 API 和 worker。配置更新仅重建受影响服务。长文档维护前先暂停上游新提交，等待 queued / running 归零；worker 默认停止宽限为 120 秒，API 为 30 秒，必要时通过 Compose `stop --timeout` 延长。
+
+监督进程收到停止信号后通知所有解析子进程，让它们完成当前文档再退出。超过停止宽限会被终止，未完成任务依靠租约恢复。信号与领取有并发窗口，当前没有全局排空或取消接口。
+
+### 旧版本升级
+
+1. 暂停提交、排空任务，备份数据库与对象文件，停止旧 API 和全部 worker。
+2. 构建并启动同版本 API / worker。schema 1/2 自动事务迁移至 3，任务、结果、租约和幂等映射保留；旧任务默认普通优先级。
+3. 迁移删除旧 `limits` 表和成本、短文档调度字段。schema 1 保留原解析选项并清除旧内容复用标记，schema 2 保留已有选项与缓存资格。
+4. 更新旧 `.env` 的容量和超时值，删除 `QUEUE_MAX_WORK`；旧值不会自动覆盖。worker 协议为 3，旧 worker 会被拒绝。
+5. 预热后用实际 PDF 验证接口，再恢复流量。迁移后回退需恢复升级前备份。
+
+模型或解析器升级时同步更新权重、API、worker 和 `MODEL_REVISION`，先排空旧任务。服务校验版本标识，不自动为旧任务挑选旧模型。
+
+## 备份、恢复和清理
+
+在线数据库备份：
 
 ```bash
-docker compose exec mineru-api python -m app.cli.queue limits \
-  --max-pending 64 --max-work 4096 --max-uploads 8
+docker compose exec mineru-api python -m app.cli.queue \
+  --database /data/queue.sqlite3 backup /data/backup.sqlite3
 ```
 
-命令在事务中更新上限，不删除已有任务。降低上限后，已有负载可以暂时高于新上限，新建任务会继续受准入限制，直到负载降低。随后同步更新本地部署配置，否则 API 下次启动会因配置与数据库不一致而失败。
+四卡部署使用相同三份 Compose 文件执行该命令。备份命令只包含 SQLite，不包含 PDF、Markdown、模型或凭据；不要单独复制正在变化的数据库主文件。
 
-同步等待数、传输数、超时和其他限制来自 API 进程配置，也应保持所有进程一致。优先根据实际文档分布和延迟目标设置预算，具体计费和短任务规则见[调度实现](scheduling.md)。
-
-## 停止、重启与升级
-
-worker 收到 SIGTERM/SIGINT 后设置停止标志，各线程在当前任务结束后停止继续领取；信号与领取可能有并发窗口，不是协调端的全局排空屏障。Compose 默认给 worker 120 秒停止宽限，超过后终止容器。尚未完成的任务依靠租约过期恢复。
-
-API 重启不删除已提交任务，但长时间无法续租会使正在运行的 worker 退出，并触发后续重试。计划维护时应先暂停上游新提交，再等待 `/health` 的 `queued` 和 `running` 均为 0，再停止或更新服务。当前没有内置的全局 drain 接口。
-
-升级模型或解析器时，先排空旧任务，统一更新模型文件、协调端和 worker 版本及 `MODEL_REVISION`，再启动预热和恢复流量。领取接口检查解析器版本、worker 协议版本与模型标识，但不验证实际权重的内容摘要，也不按旧版本任务自动选择不同 worker。
-
-1.1 → 1.2 会自动迁移数据库到 schema 2，API 与 worker 需要同步升级；已有 `.env` 的超时值不会自动改变。升级步骤见[FastGPT 契约](fastgpt.md#从-11-升级)。
-
-## 文件存储与清理
-
-`OBJECT_STORAGE=local` 时，文件保留在协调端持久卷；`s3` 时，配置 `S3_BUCKET`、`S3_ENDPOINT_URL` 和标准 AWS 凭据。只有协调端访问这些对象，worker 经认证 API 下载 PDF 和上传 Markdown。
-
-缓存预算只约束可复用的成功结果，任务保留期内的其他结果和待清理文件仍占空间。需要另外监控文件系统或对象存储容量。后台清理失败会保留垃圾键重试，但当前没有全量对象核对或总存储配额；崩溃窗口可能遗留孤儿文件，详见[文件清理与故障边界](scheduling.md#6-文件清理与故障边界)。
-
-文件中转仍消耗协调端带宽和内存。若它成为进一步扩容的瓶颈，可在后续实现预签名直传和下载；当前版本没有这条数据路径。
-
-## 备份与恢复
-
-数据库备份使用 SQLite 在线 backup API：
+需要联合恢复点时，暂停提交并排空任务，停止全部 worker 和 API，再在维护容器中运行相同备份命令，并复制关联对象。停机备份示例：
 
 ```bash
-docker compose exec mineru-api python -m app.cli.queue backup /data/backup.sqlite3
-```
-
-这个命令只备份数据库，不包含 PDF、Markdown、模型或部署凭据。不要单独复制正在变化的数据库主文件代替在线备份；也不要把“在线数据库备份 + 任意时刻的对象复制”当成跨存储一致快照。
-
-当前没有一键联合快照功能。需要可恢复的一组数据时，采用以下维护流程：
-
-1. 暂停上游新提交，等待在途任务结束，并停止 worker。
-2. 停止 API，避免任务保留清理和对象删除继续改变备份范围。
-3. 在维护容器中对同一持久卷运行备份命令，再备份关联对象。也可在服务全部停止后使用存储系统提供的一致快照；使用 S3 时需保留相应对象版本或采取等效的数据保护方式。
-4. 恢复时将数据库与这组对象一起恢复到持久存储，使用匹配的配置、模型与凭据启动 API，再启动 worker 并做冒烟检查。
-
-单解析单元在暂停流量、确认任务排空后的维护命令示例：
-
-```bash
-docker compose stop mineru-worker mineru-api
 docker compose run --rm --no-deps --entrypoint python mineru-api \
-  -m app.cli.queue backup /data/backup.sqlite3
+  -m app.cli.queue --database /data/queue.sqlite3 backup /data/backup.sqlite3
 ```
 
-多解析单元要停止全部 worker；对象备份完成前保持 API 停止。维护容器复用同一持久卷，只运行备份命令，不启动 API 和清理循环。
+对象备份期间保持 API 停止，避免后台清理改变文件集合。恢复时将数据库与对应对象一起恢复，使用匹配的模型和配置启动。`docker compose down` 保留命名卷，`down -v` 删除数据；主机或磁盘损坏的自动恢复尚未实现。
 
-停止服务并不自动修复已经丢失的对象。主机掉电、磁盘损坏和真实 S3 故障恢复尚未完成实测，已验证范围见[验证说明](validation.md)。
-
-## 监控与排障入口
-
-API `/metrics` 是同一个数据库的全局视图。多 API 进程不会产生各自独立的任务计数，采集多个入口时应选择单一入口，或对重复的全局视图取 max，不能直接相加。网关指标属于进程内指标，当前部署保持一个网关进程。
-
-阶段指标只使用固定阶段、档位和副本序号，不记录文件名、正文或部署地址。SDK 阶段是嵌套墙钟计时，可能重叠，不能直接相加。网关的 HTTP 时间和准入等待也不能替代 vLLM 内部排队、prefill/decode 和 KV 缓存指标。
-
-排障顺序为：任务状态及错误码 → 全局排队和重试 → worker 与存储日志 → SDK 阶段 → 网关及 vLLM 原生指标。逐项异常的自动处理和人工操作见[异常处理表](scheduling.md#5-异常情况如何处理)。
+后台按保留期清理任务和文件，删除失败保留垃圾记录重试。缓存预算只限制复用资格，不限制全部保留结果或总磁盘用量；仍需监控容量。业务失败由调用方处理，当前没有原 ID 手动重排接口。故障码与文件清理边界见[调度说明](scheduling.md)。

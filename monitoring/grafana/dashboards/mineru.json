@@ -932,8 +932,8 @@
     {
       "id": 17,
       "type": "timeseries",
-      "title": "加权在途工作量",
-      "description": "等待和执行中的页数乘解析档位权重，不是单纯的任务数。",
+      "title": "在途文档页数",
+      "description": "等待和执行中的原 PDF 页数之和，仅用于观察积压，不参与准入。",
       "datasource": {
         "type": "prometheus",
         "uid": "mineru-prometheus"
@@ -966,8 +966,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "mineru_work_units{job=\"mineru\",instance=\"$instance\"}",
-          "legendFormat": "页数 × 档位权重",
+          "expr": "mineru_pending_pages{job=\"mineru\",instance=\"$instance\"}",
+          "legendFormat": "在途页数",
           "range": true,
           "instant": false,
           "datasource": {

@@ -46,16 +46,14 @@ def read_observability(store):
             "SELECT coalesce(sum(pages),0) FROM jobs WHERE state='succeeded' AND finished>=?",
             (store.clock() - window,),
         ).fetchone()[0]
-        limits = connection.execute("SELECT * FROM limits WHERE id=1").fetchone()
     pages, seconds = totals["measured_pages"], totals["parse_seconds"]
     return {
         "queue": {
             "queued": states["queued"],
             "running": states["running"],
             "pending": states["queued"] + states["running"],
-            "max_pending": limits["max_pending"],
-            "work_units": states["work_units"],
-            "max_work_units": limits["max_work"],
+            "max_pending": store.settings.max_pending,
+            "pending_pages": states["pending_pages"],
             "oldest_wait_seconds": states["oldest_wait_seconds"],
         },
         "parsing": {

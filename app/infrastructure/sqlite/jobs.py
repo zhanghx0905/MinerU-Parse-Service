@@ -6,13 +6,9 @@ import time
 from uuid import uuid4
 
 from app.domain.jobs import (
-    AGING_SECONDS,
-    SHORT_JOB_MAX_PAGES,
-    TIER_WEIGHTS,
     IdempotencyConflict,
     LeaseLost,
     ServiceBusy,
-    WorkBudgetExceeded,
 )
 from app.domain.parsing import ParseOptions
 from app.infrastructure.sqlite.database import QueueDatabase
@@ -26,10 +22,7 @@ class QueueStore(QueueDatabase):
         self.settings = settings
         self.config = queue_settings
         self.clock = clock
-        super().__init__(
-            queue_settings.database,
-            (settings.max_pending, queue_settings.max_work, queue_settings.max_uploads),
-        )
+        super().__init__(queue_settings.database)
 
     @staticmethod
     def _garbage(connection, key):
@@ -70,7 +63,8 @@ class QueueStore(QueueDatabase):
             self._observe(connection, tier, timings)
 
     def _terminal(self, connection, job, error, now):
-        self._garbage(connection, job["input_key"])
+        # Failed inputs stay available for diagnosis/recovery until retention
+        # expires. A transient infrastructure failure must not erase the source.
         if job["lease_token"]:
             self._garbage(connection, f"results/{job['lease_token']}.md")
         connection.execute(
@@ -92,11 +86,12 @@ class QueueStore(QueueDatabase):
             "SELECT * FROM jobs WHERE state='running' AND lease_until<=?", (now,)
         ).fetchall():
             self._retry(connection, job, "lease_expired", now)
-        for job in connection.execute(
-            "SELECT * FROM jobs WHERE state='queued' AND queued<?",
-            (now - self.config.max_queue_seconds,),
-        ).fetchall():
-            self._terminal(connection, job, "queue_timeout", now)
+        if self.config.max_queue_seconds:
+            for job in connection.execute(
+                "SELECT * FROM jobs WHERE state='queued' AND queued<?",
+                (now - self.config.max_queue_seconds,),
+            ).fetchall():
+                self._terminal(connection, job, "queue_timeout", now)
         connection.execute(
             "UPDATE jobs SET dedup_key=NULL WHERE state='succeeded' "
             "AND dedup_key IS NOT NULL AND cache_until<=?",
@@ -123,8 +118,7 @@ class QueueStore(QueueDatabase):
         with self.transaction() as connection:
             self._sweep(connection, now)
             count = connection.execute("SELECT count(*) FROM uploads").fetchone()[0]
-            limit = connection.execute("SELECT max_uploads FROM limits WHERE id=1").fetchone()[0]
-            if count >= limit:
+            if count >= self.config.max_uploads:
                 raise ServiceBusy("Upload capacity is full; retry later")
             if wait_for_result:
                 waiting = connection.execute("SELECT count(*) FROM waiters").fetchone()[0]
@@ -195,15 +189,14 @@ class QueueStore(QueueDatabase):
         idempotency_key=None,
         upload_token=None,
         options=None,
+        priority=0,
     ):
         now = self.clock()
         options = options or ParseOptions()
-        cost = pages * TIER_WEIGHTS[tier]
+        if priority not in {0, 1}:
+            raise ValueError("priority must be 0 or 1")
         with self.transaction() as connection:
             self._sweep(connection, now)
-            limits = connection.execute("SELECT * FROM limits WHERE id=1").fetchone()
-            if cost > limits["max_work"]:
-                raise WorkBudgetExceeded("Document exceeds the queue work budget")
             if (
                 upload_token
                 and not connection.execute(
@@ -221,7 +214,7 @@ class QueueStore(QueueDatabase):
                     if existing["fingerprint"] != fingerprint:
                         raise IdempotencyConflict("Idempotency key was used for different input")
                     self._counter(connection, "idempotency_hit")
-                    return dict(existing), True
+                    return self._promote(connection, existing, priority), True
             if not disable_cache:
                 existing = connection.execute(
                     "SELECT * FROM jobs WHERE dedup_key=?", (fingerprint,)
@@ -235,24 +228,19 @@ class QueueStore(QueueDatabase):
                     self._counter(
                         connection, "cache_hit" if existing["state"] == "succeeded" else "coalesced"
                     )
-                    return dict(existing), True
-            count, work = connection.execute(
-                "SELECT count(*),coalesce(sum(cost),0) FROM jobs "
-                "WHERE state IN ('queued','running')"
-            ).fetchone()
-            if count >= limits["max_pending"] or work + cost > limits["max_work"]:
+                    return self._promote(connection, existing, priority), True
+            count = connection.execute(
+                "SELECT count(*) FROM jobs WHERE state IN ('queued','running')"
+            ).fetchone()[0]
+            if count >= self.settings.max_pending:
                 raise ServiceBusy("Parse queue is full; retry later")
-            lane = "short" if pages <= SHORT_JOB_MAX_PAGES else "bulk"
-            reserved = min(1, limits["max_pending"] - 1)
-            if lane == "bulk" and count >= limits["max_pending"] - reserved:
-                raise ServiceBusy("Bulk queue is full; retry later")
             job_id = uuid4().hex
             # Explicit independent keys may intentionally represent distinct jobs.
             dedup = fingerprint if not disable_cache else None
             connection.execute(
                 "INSERT INTO jobs (id,fingerprint,dedup_key,idempotency_key,input_key,"
-                "tier,encode_img,pages,cost,lane,state,created,queued,available,parse_options) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,'queued',?,?,?,?)",
+                "tier,encode_img,pages,priority,state,created,queued,available,parse_options) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'queued',?,?,?,?)",
                 (
                     job_id,
                     fingerprint,
@@ -262,8 +250,7 @@ class QueueStore(QueueDatabase):
                     tier,
                     int(encode_img),
                     pages,
-                    cost,
-                    lane,
+                    priority,
                     now,
                     now,
                     now,
@@ -279,13 +266,24 @@ class QueueStore(QueueDatabase):
                 connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             ), False
 
-    def claim(self, worker_id):
+    @staticmethod
+    def _promote(connection, job, priority):
+        job = dict(job)
+        if priority > job["priority"] and job["state"] in {"queued", "running"}:
+            connection.execute("UPDATE jobs SET priority=? WHERE id=?", (priority, job["id"]))
+            job["priority"] = priority
+        return job
+
+    def claim(self, worker_id, min_priority=0):
+        if min_priority not in {0, 1}:
+            raise ValueError("min_priority must be 0 or 1")
         now = self.clock()
         # Idle polling is read-only except for periodic liveness refreshes.
         with self.connect() as reader:
             seen = reader.execute("SELECT seen FROM workers WHERE id=?", (worker_id,)).fetchone()
             pending = reader.execute(
-                "SELECT 1 FROM jobs WHERE state='queued' AND available<=? LIMIT 1", (now,)
+                "SELECT 1 FROM jobs WHERE state='queued' AND available<=? AND priority>=? LIMIT 1",
+                (now, min_priority),
             ).fetchone()
             if seen and seen[0] > now - min(5, self.config.lease_seconds / 3) and not pending:
                 return None
@@ -294,9 +292,9 @@ class QueueStore(QueueDatabase):
             connection.execute("INSERT OR REPLACE INTO workers VALUES (?,?)", (worker_id, now))
             job = connection.execute(
                 "SELECT * FROM jobs WHERE state='queued' AND available<=? "
-                "ORDER BY CASE WHEN queued<? THEN 0 WHEN lane='short' THEN 1 ELSE 2 END,queued,id "
+                "AND priority>=? ORDER BY priority DESC,queued,id "
                 "LIMIT 1",
-                (now, now - AGING_SECONDS),
+                (now, min_priority),
             ).fetchone()
             if not job:
                 return None
@@ -420,8 +418,8 @@ class QueueStore(QueueDatabase):
                 row[0]: row[1]
                 for row in connection.execute("SELECT state,count(*) FROM jobs GROUP BY state")
             }
-            work = connection.execute(
-                "SELECT coalesce(sum(cost),0) FROM jobs WHERE state IN ('queued','running')"
+            pages = connection.execute(
+                "SELECT coalesce(sum(pages),0) FROM jobs WHERE state IN ('queued','running')"
             ).fetchone()[0]
             oldest = connection.execute(
                 "SELECT min(queued) FROM jobs WHERE state='queued'"
@@ -434,7 +432,7 @@ class QueueStore(QueueDatabase):
                     state: states.get(state, 0)
                     for state in ("queued", "running", "succeeded", "failed")
                 },
-                "work_units": work,
+                "pending_pages": pages,
                 "oldest_wait_seconds": max(0, now - oldest) if oldest else 0,
                 "workers": workers,
             }

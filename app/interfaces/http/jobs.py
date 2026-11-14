@@ -3,7 +3,7 @@
 import json
 import math
 import time
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Header, HTTPException, Path, Request
 from pydantic import BaseModel, Field
@@ -36,6 +36,7 @@ def public_job(job):
                 "id",
                 "state",
                 "tier",
+                "priority",
                 "encode_img",
                 "pages",
                 "attempts",
@@ -90,6 +91,7 @@ class Claim(BaseModel):
     model_revision: str = Field(max_length=200)
     mineru_version: str = Field(max_length=30)
     protocol_version: int = 1
+    min_priority: Literal[0, 1] = 0
 
 
 @router.post("/internal/worker/claim")
@@ -102,8 +104,8 @@ async def claim(body: Claim, request: Request):
     ):
         raise HTTPException(409, "Worker model or parser version does not match coordinator")
     if body.protocol_version != WORKER_PROTOCOL_VERSION:
-        raise HTTPException(409, "Worker protocol does not support parse options; upgrade worker")
-    job = await run_in_threadpool(service.store.claim, body.worker_id)
+        raise HTTPException(409, "Worker protocol does not match; upgrade API and worker together")
+    job = await run_in_threadpool(service.store.claim, body.worker_id, body.min_priority)
     if job is None:
         return Response(status_code=204)
     return {

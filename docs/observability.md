@@ -15,7 +15,7 @@ curl http://127.0.0.1:3888/metrics
 | --- | --- |
 | `queue.queued` / `queue.running` | 等待与执行中的任务数 |
 | `queue.pending` / `queue.max_pending` | 全部在途任务数与数量预算 |
-| `queue.work_units` / `queue.max_work_units` | 页数乘档位权重的工作量与预算 |
+| `queue.pending_pages` | 等待与执行中的原 PDF 页数之和，不作为准入预算 |
 | `queue.oldest_wait_seconds` | 最老等待任务的本次排队时长 |
 | `parsing.completed_jobs` / `parsing.completed_pages` | 采集以来成功执行并发布的文档数与页数 |
 | `parsing.measured_jobs` / `parsing.measured_pages` | 带有效执行计时的成功样本量 |
@@ -26,6 +26,8 @@ curl http://127.0.0.1:3888/metrics
 | `parsing.recent_completed_pages` | 窗口内成功完成的页数 |
 | `parsing.recent_pages_per_minute` | 整个 worker 池的近期墙钟吞吐，页/分钟 |
 | `workers` | 最近活跃的 worker 进程数 |
+
+`workers` 统计向协调端领取或续租的解析子进程，不统计容器、监督进程或 SDK 辅助进程。四卡默认配置全部预热后应有 32 个；退出进程的记录在两个租约周期内仍可能暂时计入。
 
 ## 平均速度的口径
 
@@ -46,7 +48,7 @@ curl http://127.0.0.1:3888/metrics
 | `mineru_tasks{state="queued"}` | 全局等待积压 |
 | `mineru_tasks{state="running"}` | 执行中任务数 |
 | `mineru_oldest_wait_seconds` | 最老任务的排队时间 |
-| `mineru_work_units` | 全局加权工作量 |
+| `mineru_pending_pages` | 全局在途页数 |
 | `mineru_workers` | 最近活跃 worker 进程数 |
 | `mineru_processed_pages_total{tier}` | 成功执行并发布的累计页数 |
 | `mineru_measured_pages_total{tier}` | 有配对执行计时的累计页数 |

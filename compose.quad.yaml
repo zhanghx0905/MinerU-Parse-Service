@@ -1,0 +1,85 @@
+# Four GPU units: 8 independent processes per GPU, 2 reserved for priority=1.
+# Use with compose.yaml and compose.scale.yaml, one container per worker service.
+services:
+  mineru-worker:
+    environment:
+      PARSE_WORKERS: ${WORKERS_PER_GPU:-8}
+      PRIORITY_WORKERS: 1
+
+  mineru-worker-b:
+    environment:
+      PARSE_WORKERS: ${WORKERS_PER_GPU:-8}
+      PRIORITY_WORKERS: 1
+
+  mineru-worker-c:
+    extends:
+      file: compose.yaml
+      service: mineru-worker
+    environment:
+      PARSE_WORKERS: ${WORKERS_PER_GPU:-8}
+      PRIORITY_WORKERS: 0
+    depends_on:
+      mineru-api:
+        condition: service_healthy
+      mineru-vlm-c:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices: !override
+            - driver: nvidia
+              device_ids: ["${GPU_ID_C:-2}"]
+              capabilities: [gpu]
+
+  mineru-worker-d:
+    extends:
+      file: compose.yaml
+      service: mineru-worker
+    environment:
+      PARSE_WORKERS: ${WORKERS_PER_GPU:-8}
+      PRIORITY_WORKERS: 0
+    depends_on:
+      mineru-api:
+        condition: service_healthy
+      mineru-vlm-d:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices: !override
+            - driver: nvidia
+              device_ids: ["${GPU_ID_D:-3}"]
+              capabilities: [gpu]
+
+  mineru-vlm-c:
+    extends:
+      file: compose.yaml
+      service: mineru-vlm
+    deploy:
+      resources:
+        reservations:
+          devices: !override
+            - driver: nvidia
+              device_ids: ["${GPU_ID_C:-2}"]
+              capabilities: [gpu]
+
+  mineru-vlm-d:
+    extends:
+      file: compose.yaml
+      service: mineru-vlm
+    deploy:
+      resources:
+        reservations:
+          devices: !override
+            - driver: nvidia
+              device_ids: ["${GPU_ID_D:-3}"]
+              capabilities: [gpu]
+
+  mineru-vlm-gateway:
+    environment:
+      VLM_UPSTREAMS: http://mineru-vlm:8000,http://mineru-vlm-b:8000,http://mineru-vlm-c:8000,http://mineru-vlm-d:8000
+    depends_on:
+      mineru-vlm-c:
+        condition: service_healthy
+      mineru-vlm-d:
+        condition: service_healthy

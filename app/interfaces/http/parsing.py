@@ -6,13 +6,13 @@ import time
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
 from app.application.queue import QueueService
-from app.domain.jobs import IdempotencyConflict, ServiceBusy, WorkBudgetExceeded
+from app.domain.jobs import IdempotencyConflict, ServiceBusy
 from app.domain.parsing import ParseOptions, Tier
 from app.infrastructure.pdf import validate_pdf
 from app.interfaces.http.admission import release_upload
@@ -41,6 +41,7 @@ class Submission:
     tier: Tier
     idempotency_key: str | None
     timings: dict[str, float]
+    priority: int = 0
 
 
 async def prepare_submission(
@@ -53,6 +54,7 @@ async def prepare_submission(
     disable_cache: bool = False,
     encode_img: bool = True,
     tier: Tier | None = None,
+    priority: Annotated[int, Query(ge=0, le=1)] = 0,
 ):
     """Read FastGPT form flags; existing cache/image/tier controls remain query parameters."""
     settings = request.app.state.service.settings
@@ -76,6 +78,7 @@ async def prepare_submission(
             encode_img=encode_img,
             disable_cache=disable_cache,
             tier=tier or settings.tier,
+            priority=priority,
             idempotency_key=key,
             timings={
                 "api.validate": time.perf_counter() - started,
@@ -111,13 +114,12 @@ async def submit_durable(request, submission):
             idempotency_key=submission.idempotency_key,
             timings=submission.timings,
             options=submission.options,
+            priority=submission.priority,
         )
     except ServiceBusy as exc:
         raise ParseError(503, str(exc), headers={"Retry-After": "5"}) from exc
     except IdempotencyConflict as exc:
         raise ParseError(409, str(exc), "invalidParseFile") from exc
-    except WorkBudgetExceeded as exc:
-        raise ParseError(413, str(exc), "invalidParseFile") from exc
 
 
 @router.post("/v2/parse/file", response_model=ParseResponse)
@@ -133,6 +135,8 @@ async def parse(request: Request, submission: Annotated[Submission, Depends(prep
             await release_upload(request)
             result = await service.wait(job["id"], timeout=remaining_wait(request))
         else:
+            if submission.priority:
+                raise ParseError(503, "Priority scheduling requires durable queue mode")
             if submission.idempotency_key:
                 raise ParseError(503, "Idempotency-Key requires durable queue mode")
             await release_upload(request)

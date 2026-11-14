@@ -4,8 +4,7 @@ import math
 import os
 from dataclasses import dataclass
 
-from app.domain.jobs import TIER_WEIGHTS
-from app.domain.parsing import Tier
+from app.domain.parsing import TIERS, Tier
 
 
 @dataclass(frozen=True)
@@ -14,9 +13,10 @@ class Settings:
     tier: Tier = "standard"
     preload_models: bool = True
     parse_workers: int = 2
+    priority_workers: int = 0
     max_upload_bytes: int = 50 * 1024 * 1024
     max_pages: int = 1000
-    max_pending: int = 8
+    max_pending: int = 10000
     request_timeout: float = 540
     api_key: str = ""
     cache_bytes: int = 128 * 1024 * 1024
@@ -25,7 +25,7 @@ class Settings:
     def __post_init__(self):
         if self.service_mode not in {"inline", "queue"}:
             raise ValueError("SERVICE_MODE must be inline or queue")
-        if self.tier not in TIER_WEIGHTS:
+        if self.tier not in TIERS:
             raise ValueError("PARSE_TIER must be flash, basic, standard or advanced")
         for name in (
             "max_upload_bytes",
@@ -39,6 +39,8 @@ class Settings:
                 raise ValueError(f"{name} must be positive")
         if self.cache_bytes < 0:
             raise ValueError("cache_bytes must be nonnegative")
+        if not 0 <= self.priority_workers <= self.parse_workers:
+            raise ValueError("PRIORITY_WORKERS must be between 0 and PARSE_WORKERS")
 
     @classmethod
     def from_env(cls):
@@ -48,6 +50,7 @@ class Settings:
             tier=os.getenv("PARSE_TIER", defaults.tier),
             preload_models=os.getenv("PRELOAD_MODELS", "true").lower() in {"1", "true", "yes"},
             parse_workers=int(os.getenv("PARSE_WORKERS", defaults.parse_workers)),
+            priority_workers=int(os.getenv("PRIORITY_WORKERS", defaults.priority_workers)),
             max_upload_bytes=int(os.getenv("MAX_UPLOAD_BYTES", defaults.max_upload_bytes)),
             max_pages=int(os.getenv("MAX_PAGES", defaults.max_pages)),
             max_pending=int(os.getenv("MAX_PENDING", defaults.max_pending)),
@@ -67,24 +70,22 @@ class QueueSettings:
     s3_endpoint: str | None = None
     worker_token: str = ""
     worker_api_url: str = "http://127.0.0.1:3888"
-    max_work: int = 4096
-    max_uploads: int = 8
-    max_sync_waiters: int = 8
-    max_transfers: int = 8
+    max_uploads: int = 64
+    max_sync_waiters: int = 64
+    max_transfers: int = 64
     transfer_seconds: float = 120
     upload_seconds: float = 120
     lease_seconds: float = 60
     heartbeat_seconds: float = 10
     poll_seconds: float = 0.25
     max_attempts: int = 3
-    max_queue_seconds: float = 300
+    max_queue_seconds: float = 0
     retention_seconds: float = 86400
     max_result_bytes: int = 64 * 1024 * 1024
     model_revision: str = "MinerU2.5-Pro-2605-1.2B"
 
     def __post_init__(self):
         for name in (
-            "max_work",
             "max_uploads",
             "max_sync_waiters",
             "max_transfers",
@@ -94,7 +95,6 @@ class QueueSettings:
             "heartbeat_seconds",
             "poll_seconds",
             "max_attempts",
-            "max_queue_seconds",
             "retention_seconds",
             "max_result_bytes",
         ):
@@ -102,6 +102,8 @@ class QueueSettings:
                 raise ValueError(f"{name} must be positive")
         if self.heartbeat_seconds >= self.lease_seconds / 2:
             raise ValueError("Heartbeat interval must be less than half of the lease")
+        if not math.isfinite(self.max_queue_seconds) or self.max_queue_seconds < 0:
+            raise ValueError("max_queue_seconds must be nonnegative (0 disables queue expiry)")
         if self.storage not in {"local", "s3"}:
             raise ValueError("OBJECT_STORAGE must be local or s3")
         if self.storage == "s3" and not self.s3_bucket:
@@ -124,7 +126,6 @@ class QueueSettings:
         for name, env in names.items():
             values[name] = os.getenv(env, getattr(defaults, name))
         for name in (
-            "max_work",
             "max_uploads",
             "max_sync_waiters",
             "max_transfers",

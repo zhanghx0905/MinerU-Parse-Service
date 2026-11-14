@@ -47,7 +47,7 @@ def test_backlog_distinguishes_queued_and_running_without_inventing_speed(store)
     assert snapshot["queue"]["queued"] == 1
     assert snapshot["queue"]["running"] == 1
     assert snapshot["queue"]["pending"] == 2
-    assert snapshot["queue"]["work_units"] == 33
+    assert snapshot["queue"]["pending_pages"] == 11
     assert snapshot["queue"]["oldest_wait_seconds"] == 7
     assert snapshot["parsing"]["average_pages_per_second"] is None
 

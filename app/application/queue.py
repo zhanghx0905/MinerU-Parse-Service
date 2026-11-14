@@ -41,6 +41,7 @@ class QueueService:
         idempotency_key=None,
         timings=None,
         options: ParseOptions | None = None,
+        priority=0,
     ):
         owned_upload = upload_token is None
         if owned_upload:
@@ -69,6 +70,7 @@ class QueueService:
                 idempotency_key=idempotency_key,
                 upload_token=upload_token,
                 options=options,
+                priority=priority,
             )
             try:
                 await run_in_threadpool(self.store.observe, tier, measurements)

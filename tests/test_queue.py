@@ -108,30 +108,34 @@ def test_expired_lease_is_retried_and_stale_worker_cannot_commit(configuration):
 def test_queue_deadline_retry_exhaustion_and_cleanup(configuration):
     settings, config = configuration
     now = [100.0]
-    store = QueueStore(settings, replace(config, max_attempts=1), clock=lambda: now[0])
+    store = QueueStore(
+        settings, replace(config, max_attempts=1, max_queue_seconds=300), clock=lambda: now[0]
+    )
     job, _ = submit(store)
     attempt = store.claim(uuid4().hex)
     store.fail(job["id"], attempt["lease_token"])
     assert store.get(job["id"])["state"] == "failed"
     waiting, _ = submit(store)
-    now[0] += config.max_queue_seconds + 1
+    now[0] += store.config.max_queue_seconds + 1
     store.maintenance()
     assert store.get(waiting["id"])["error"] == "queue_timeout"
     now[0] += config.retention_seconds + 1
     store.maintenance()
     assert store.get(job["id"]) is None
-    assert store.stats()["work_units"] == 0
+    assert store.stats()["pending_pages"] == 0
     assert store.garbage()
 
 
-def test_work_budget_and_short_job_reservation(configuration):
+def test_large_documents_use_the_same_capacity_as_small_documents(configuration):
     settings, config = configuration
-    store = QueueStore(replace(settings, max_pending=2), replace(config, max_work=40))
-    submit(store, pages=9)
+    store = QueueStore(replace(settings, max_pending=2), config)
+    first, _ = submit(store, pages=1000)
+    second, _ = submit(store, pages=1000)
     with pytest.raises(ServiceBusy):
-        submit(store, pages=9)
-    submit(store, pages=1)
-    assert store.stats()["work_units"] == 30
+        submit(store)
+    assert store.stats()["pending_pages"] == 2000
+    assert store.claim(uuid4().hex)["id"] == first["id"]
+    assert store.claim(uuid4().hex)["id"] == second["id"]
 
 
 def test_expired_upload_does_not_delete_committed_job_input(configuration):
@@ -165,7 +169,7 @@ def test_http_async_lifecycle_authentication_metrics_and_reuse(configuration):
                 "worker_id": uuid4().hex,
                 "model_revision": config.model_revision,
                 "mineru_version": version("mineru"),
-                "protocol_version": 2,
+                "protocol_version": 3,
             },
         ).json()
         lease = {**headers, "X-Task-Lease": claimed["lease_token"]}
@@ -201,18 +205,19 @@ def test_sync_waiter_timeout_does_not_cancel_durable_job(configuration, monkeypa
             raise asyncio.TimeoutError
 
         monkeypatch.setattr(client.app.state.service, "wait", timed_out)
-        response = client.post("/v2/parse/file", files={"file": ("test.pdf", pdf())})
+        response = client.post("/v2/parse/file?priority=1", files={"file": ("test.pdf", pdf())})
         assert response.status_code == 504
+        assert client.get(response.headers["Location"]).json()["priority"] == 1
         assert client.get("/health").json()["pending"] == 1
         assert client.post("/jobs", files={"file": ("test.pdf", pdf())}).json()["reused"]
 
 
-def test_both_submission_routes_reject_documents_exceeding_work_budget(configuration):
+def test_both_submission_routes_still_enforce_the_document_page_limit(configuration):
     settings, config = configuration
-    app = create_app(settings, queue_settings=replace(config, max_work=2))
+    app = create_app(replace(settings, max_pages=1), queue_settings=config)
     with TestClient(app) as client:
         for route in ("/jobs", "/v2/parse/file"):
-            response = client.post(route, files={"file": ("sample.pdf", pdf())})
+            response = client.post(route, files={"file": ("sample.pdf", pdf(2))})
             assert response.status_code == 413
         assert client.get("/health").json()["pending"] == 0
 
@@ -380,7 +385,7 @@ def test_transfer_capacity_is_global(configuration):
     second.release_transfer(following)
 
 
-def test_online_backup_and_limit_update_preserve_jobs(configuration, tmp_path, monkeypatch):
+def test_online_backup_preserves_jobs(configuration, tmp_path, monkeypatch):
     import sys
 
     from app.cli.queue import main
@@ -395,26 +400,6 @@ def test_online_backup_and_limit_update_preserve_jobs(configuration, tmp_path, m
     main()
     restored = QueueStore(settings, replace(config, database=str(destination)))
     assert restored.get(job["id"])["state"] == "queued"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "queue_admin",
-            "--database",
-            config.database,
-            "limits",
-            "--max-pending",
-            "1",
-            "--max-work",
-            "50",
-            "--max-uploads",
-            "1",
-        ],
-    )
-    main()
-    assert store.get(job["id"])["state"] == "queued"
-    with pytest.raises(ServiceBusy):
-        submit(store)
 
 
 def test_unfixed_sqlite_is_rejected(monkeypatch):
@@ -425,3 +410,35 @@ def test_unfixed_sqlite_is_rejected(monkeypatch):
     monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 51, 2))
     with pytest.raises(RuntimeError, match="Concurrent WAL"):
         ensure_safe_wal()
+
+
+def test_failed_input_is_retained_until_job_retention_expires(configuration):
+    from app.infrastructure.storage import LocalStorage
+
+    settings, config = configuration
+    now = [100.0]
+    store = QueueStore(settings, replace(config, max_attempts=1), clock=lambda: now[0])
+    storage = LocalStorage(config.object_dir)
+    token = store.reserve_upload()
+    key = f"inputs/{token}.pdf"
+    payload = pdf()
+    storage.put(key, payload)
+    job, _ = store.submit(
+        fingerprint="recoverable",
+        input_key=key,
+        pages=1,
+        tier="standard",
+        encode_img=True,
+        upload_token=token,
+    )
+    store.release_upload(token)
+    attempt = store.claim(uuid4().hex)
+    store.fail(job["id"], attempt["lease_token"])
+    store.maintenance()
+    assert store.get(job["id"])["state"] == "failed"
+    assert key not in store.garbage()
+    assert storage.get(key) == payload
+    now[0] += config.retention_seconds + 1
+    store.maintenance()
+    assert store.get(job["id"]) is None
+    assert key in store.garbage()

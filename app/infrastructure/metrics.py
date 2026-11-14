@@ -121,7 +121,7 @@ class QueueCollector:
         for state in ("queued", "running", "succeeded", "failed"):
             queued.add_metric([state], stats[state])
         yield queued
-        for name in ("work_units", "oldest_wait_seconds", "workers"):
+        for name in ("pending_pages", "oldest_wait_seconds", "workers"):
             metric = GaugeMetricFamily("mineru_" + name, "Coordinator " + name)
             metric.add_metric([], stats[name])
             yield metric
