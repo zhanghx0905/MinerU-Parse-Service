@@ -2,6 +2,8 @@
 
 基于 MinerU 4.0.12 的 PDF 转 Markdown 服务，支持 flash/basic/standard/advanced。SQLite WAL 保存全局任务、幂等记录和阶段指标；CPU API、GPU worker 和 vLLM 分开运行。
 
+代码阅读从[架构与阅读顺序](docs/architecture.md)开始；SDFastGPT 接入见[PDF 接口契约](docs/fastgpt.md)；队列积压和平均解析速度见[可观测性](docs/observability.md)，Prometheus 与 Grafana 部署见[监控配置](monitoring/README.md)。
+
 调度设计见[实现与异常处理](docs/scheduling.md)，包括任务流程、状态机、领取规则、租约重试及故障边界；部署操作见[运维与扩容](docs/scaling.md)。
 
 ## 部署
@@ -35,18 +37,18 @@ curl http://127.0.0.1:3888/jobs/REPLACE_WITH_TASK_ID/result
 
 状态为 queued/running/succeeded/failed。结果未就绪时返回 202 和 Retry-After；成功时返回 `success/message/markdown/pages/duration`。任务 ID 是随机标识，不包含文件名。
 
-相同内容、档位、图片选项、解析器及模型版本默认共享解析和缓存。`Idempotency-Key` 用于重试同一个逻辑请求，同一键用于不同输入返回 409；不同键可以共享同一次解析。`disable_cache=true` 跳过内容缓存和内容去重，显式幂等键仍然有效。
+相同内容、档位、全部输出选项、解析器及模型版本默认共享解析和缓存。`Idempotency-Key` 用于重试同一个逻辑请求，同一键用于不同输入返回 409；不同键可以共享同一次解析。`disable_cache=true` 跳过内容缓存和内容去重，显式幂等键仍然有效。
 
-`encode_img=false` 省略图片资源，保留识别文字、表格和公式。扫描件在 flash 下仍可能调用 OCR；不同档位的质量需单独评估。
+`encode_img=false` 省略图片资源，保留解析开关允许的识别文字、表格和公式。扫描件在 flash 下仍可能调用 OCR；不同档位的质量需单独评估。
 
 ## 同步兼容接口
 
 ```bash
-curl --max-time 6000 -F 'file=@example.pdf' \
+curl --max-time 600 -F 'file=@example.pdf' \
   'http://127.0.0.1:3888/v2/parse/file?tier=standard&encode_img=true'
 ```
 
-同步接口通过同一持久队列等待结果。HTTP 等待超时返回 504，任务继续执行。文件无效返回 400，大小/页数或单文件工作量超限返回 413，上传/传输/任务容量满返回 503（含 Retry-After）。长文档或高负载场景宜使用异步接口。
+同步接口通过同一持久队列等待结果，支持与 `/jobs` 一致的 `Idempotency-Key`。HTTP 等待超时返回 504，包含任务查询地址，任务继续执行。四个 FastGPT 表单开关和错误诊断码已适配，详见[接口契约](docs/fastgpt.md)。文件无效返回 400，大小/页数或单文件工作量超限返回 413，上传/传输/任务容量满返回 503（含 Retry-After）。长文档或高负载场景宜使用异步接口。
 
 ## 扩容
 
@@ -65,7 +67,7 @@ GPU_ID=0 GPU_ID_B=1 docker compose -f compose.yaml -f compose.scale.yaml up -d \
 
 覆盖配置明确替换 GPU 设备列表。所有 worker 从同一全局队列领取任务，不拥有本地待执行队列。推理网关在独立 vLLM 副本之间按活跃请求数分配调用，并限制活跃和等待数量。
 
-远端机器也可以运行 `python -m app.worker`，需要配置 `WORKER_API_URL`、`WORKER_API_TOKEN`、模型、GPU 和 VLM 服务地址；worker 不读取 SQLite 文件，也不需要共享对象目录。SQLite 文件保留在调度端本地磁盘，不支持放在 NFS 上供多个主机打开；调度端当前不是跨节点主动主动部署。详见[运维与扩容](docs/scaling.md)。
+远端机器也可以运行 `python -m app.interfaces.worker`，需要配置 `WORKER_API_URL`、`WORKER_API_TOKEN`、模型、GPU 和 VLM 服务地址；worker 不读取 SQLite 文件，也不需要共享对象目录。SQLite 文件保留在调度端本地磁盘，不支持放在 NFS 上供多个主机打开；调度端当前不是跨节点主动主动部署。详见[运维与扩容](docs/scaling.md)。
 
 ## 主要配置
 
@@ -87,7 +89,8 @@ GPU_ID=0 GPU_ID_B=1 docker compose -f compose.yaml -f compose.scale.yaml up -d \
 | `QUEUE_RETENTION_SECONDS` | 86400 | 已结束任务和结果保留秒数 |
 | `QUEUE_MAX_RESULT_BYTES` | 67108864 | 单份 Markdown 结果最大 64 MiB |
 | `MAX_UPLOAD_BYTES` / `MAX_PAGES` | 52428800 / 1000 | 单文件大小和页数限制 |
-| `REQUEST_TIMEOUT` | 6000 | 同步接口等待上限 |
+| `REQUEST_TIMEOUT` | 540 | 同步请求预算，扣除上传、校验及提交耗时后等待结果 |
+| `PDF_API_KEY` | 空 | 公开解析及任务接口的可选 Bearer 密钥，与 worker 凭据独立 |
 | `WORKER_MAX_RUN_SECONDS` | 6000 | worker 执行硬期限，超时退出进程释放 GPU |
 | `CACHE_BYTES` / `CACHE_TTL` | 134217728 / 3600 | 全局内容缓存字节预算和有效秒数 |
 | `OBJECT_STORAGE` | local | local 或 s3 |
@@ -97,13 +100,13 @@ GPU_ID=0 GPU_ID_B=1 docker compose -f compose.yaml -f compose.scale.yaml up -d \
 初始队列容量写入数据库，多 API 进程必须使用一致配置。修改现有容量可通过管理命令完成，已有任务不会删除；随后同步更新部署环境配置：
 
 ```bash
-docker compose exec mineru-api python -m app.queue_admin limits \
+docker compose exec mineru-api python -m app.cli.queue limits \
   --max-pending 64 --max-work 4096 --max-uploads 8
 ```
 
 ## 监控、测试和备份
 
-`/metrics` 提供全局队列、任务事件及分阶段直方图。网关的内部 `/metrics` 提供各 vLLM 副本请求耗时、网关等待和活跃数；vLLM 本身的指标另行采集。指标只使用固定阶段、档位和副本序号，不记录文件名、正文、主机或部署地址。
+`/stats` 提供排队/运行数、最老等待时间、平均解析速度和近期吞吐；`/metrics` 提供对应 Prometheus 指标、任务事件及分阶段直方图。网关的内部 `/metrics` 提供各 vLLM 副本请求耗时、网关等待和活跃数；vLLM 本身的指标另行采集。指标只使用固定阶段、档位和副本序号，不记录文件名、正文、主机或部署地址。
 
 ```bash
 python -m venv .venv
@@ -117,7 +120,7 @@ LD_PRELOAD="$PWD/artifacts/sqlite/lib/libsqlite3.so.0" .venv/bin/python -m pytes
 .venv/bin/python scripts/load_test.py http://127.0.0.1:3888 samples/*.pdf \
   --rate 0.2 --duration 60 --output artifacts/load-test.md
 
-docker compose exec mineru-api python -m app.queue_admin backup /data/backup.sqlite3
+docker compose exec mineru-api python -m app.cli.queue backup /data/backup.sqlite3
 ```
 
 定速压测同时报告提交窗口和包含排空时间的吞吐，以及拒绝、失败、未完成和压测端丢弃数量。原始文档、数据库、备份、密钥、日志和测试产物均不纳入版本控制。

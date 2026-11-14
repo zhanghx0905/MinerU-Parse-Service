@@ -12,11 +12,10 @@ import pytest
 from fastapi.testclient import TestClient
 from pypdf import PdfWriter
 
-from app.config import Settings
-from app.jobs import IdempotencyConflict, LeaseLost, QueueStore
+from app.config import QueueSettings, Settings
+from app.domain.jobs import IdempotencyConflict, LeaseLost, ServiceBusy
+from app.infrastructure.sqlite.jobs import QueueStore
 from app.main import create_app
-from app.queue_config import QueueSettings
-from app.service import ServiceBusy
 
 
 def pdf(pages=1):
@@ -166,6 +165,7 @@ def test_http_async_lifecycle_authentication_metrics_and_reuse(configuration):
                 "worker_id": uuid4().hex,
                 "model_revision": config.model_revision,
                 "mineru_version": version("mineru"),
+                "protocol_version": 2,
             },
         ).json()
         lease = {**headers, "X-Task-Lease": claimed["lease_token"]}
@@ -191,11 +191,16 @@ def test_http_async_lifecycle_authentication_metrics_and_reuse(configuration):
         assert "private-name" not in metrics.text
 
 
-def test_sync_waiter_timeout_does_not_cancel_durable_job(configuration):
+def test_sync_waiter_timeout_does_not_cancel_durable_job(configuration, monkeypatch):
     settings, config = configuration
     with TestClient(
-        create_app(replace(settings, request_timeout=0.03), queue_settings=config)
+        create_app(replace(settings, request_timeout=5), queue_settings=config)
     ) as client:
+
+        async def timed_out(_job_id, *, timeout):
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(client.app.state.service, "wait", timed_out)
         response = client.post("/v2/parse/file", files={"file": ("test.pdf", pdf())})
         assert response.status_code == 504
         assert client.get("/health").json()["pending"] == 1
@@ -378,7 +383,7 @@ def test_transfer_capacity_is_global(configuration):
 def test_online_backup_and_limit_update_preserve_jobs(configuration, tmp_path, monkeypatch):
     import sys
 
-    from app.queue_admin import main
+    from app.cli.queue import main
 
     settings, config = configuration
     store = QueueStore(settings, config)
@@ -415,7 +420,7 @@ def test_online_backup_and_limit_update_preserve_jobs(configuration, tmp_path, m
 def test_unfixed_sqlite_is_rejected(monkeypatch):
     import sqlite3
 
-    from app.sqlite_runtime import ensure_safe_wal
+    from app.infrastructure.sqlite.runtime import ensure_safe_wal
 
     monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 51, 2))
     with pytest.raises(RuntimeError, match="Concurrent WAL"):

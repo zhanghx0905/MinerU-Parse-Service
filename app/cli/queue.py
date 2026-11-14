@@ -5,7 +5,8 @@ import os
 import sqlite3
 from pathlib import Path
 
-from .sqlite_runtime import ensure_safe_wal
+from app.infrastructure.sqlite.database import SCHEMA_VERSION
+from app.infrastructure.sqlite.runtime import ensure_safe_wal
 
 
 def main():
@@ -24,7 +25,7 @@ def main():
         parser.error("Queue database does not exist")
     with sqlite3.connect(args.database, timeout=5) as connection:
         version = connection.execute("SELECT version FROM schema_version").fetchone()
-        if not version or version[0] != 1:
+        if not version or version[0] != SCHEMA_VERSION:
             parser.error("Unsupported queue database schema")
         if args.command == "backup":
             if args.destination.resolve() == Path(args.database).resolve():

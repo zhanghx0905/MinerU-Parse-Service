@@ -1,42 +1,18 @@
 """Reuse lightweight parsers and shared models while keeping request state isolated."""
 
-from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Lock
 
-from .metrics import record_sdk_stages, timed
-
-
-@dataclass(frozen=True)
-class ParseOutput:
-    markdown: str
-    pages: int
-    timings: dict[str, float] = field(default_factory=dict)
+from app.domain.parsing import LEGACY_OPTIONS, ParseOptions, ParseOutput
+from app.infrastructure.metrics import record_sdk_stages, timed
+from app.infrastructure.mineru.rendering import render_result
 
 
 def markdown_without_images(result):
-    """Remove image assets before rendering, including SDK table/chart fallbacks."""
-    from bs4 import BeautifulSoup
-    from mineru.render import render_markdown
-    from mineru.types import BlockBase, ImagePayloadBlock, ImagePayloadContentBlock
-
-    document = result.middle_json.model_copy(deep=True)
-    pending = [block for page in document.pages for block in page.blocks]
-    while pending:
-        block = pending.pop()
-        if isinstance(block, ImagePayloadBlock):
-            block.image_base64 = block.image_path = block.image_url = None
-        if isinstance(block, ImagePayloadContentBlock) and "<img" in block.content.lower():
-            fragment = BeautifulSoup(block.content, "html.parser")
-            for image in fragment.find_all("img"):
-                image.decompose()
-            block.content = str(fragment)
-        content = getattr(block, "content", None)
-        if isinstance(content, list):
-            pending.extend(child for child in content if isinstance(child, BlockBase))
-    return render_markdown(document, image_renderer=lambda _block: "")
+    """Compatibility helper: omit image assets while keeping all recognized content."""
+    return render_result(result, False, LEGACY_OPTIONS)
 
 
 class MinerUEngine:
@@ -74,15 +50,25 @@ class MinerUEngine:
         document.save()
         self.parse(output.getvalue(), True)
 
-    def parse(self, pdf_bytes: bytes, encode_img: bool, tier: str | None = None) -> ParseOutput:
+    def parse(
+        self,
+        pdf_bytes: bytes,
+        encode_img: bool,
+        tier: str | None = None,
+        options: ParseOptions | None = None,
+    ) -> ParseOutput:
         # Public MinerU 4 SDK; model loading is lazy so HTTP startup is inexpensive.
         tier = tier or self.tier
+        options = options or ParseOptions()
+        parser_key = (tier, options.image_analysis)
         with self._parser_lock:
-            if tier not in self._parsers:
+            if parser_key not in self._parsers:
                 from mineru import MinerUParser
 
-                self._parsers[tier] = MinerUParser(tier=tier, image_analysis=True)
-            parser = self._parsers[tier]
+                self._parsers[parser_key] = MinerUParser(
+                    tier=tier, image_analysis=options.image_analysis
+                )
+            parser = self._parsers[parser_key]
 
         # This directory lives until model execution actually finishes, including
         # when the HTTP caller has already timed out or disconnected.
@@ -93,7 +79,7 @@ class MinerUEngine:
             with timed(timings, "sdk.total"), record_sdk_stages(timings):
                 result = parser.parse(path)
             with timed(timings, "markdown.render"):
-                markdown = result.markdown() if encode_img else markdown_without_images(result)
+                markdown = render_result(result, encode_img, options)
             return ParseOutput(markdown=markdown, pages=len(result.pages), timings=timings)
 
     def close(self):

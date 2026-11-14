@@ -8,9 +8,9 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import JSONResponse
 
-from .service import ServiceBusy
+from app.domain.jobs import ServiceBusy
+from app.interfaces.http.errors import error_response
 
 
 class UploadAdmission:
@@ -59,16 +59,18 @@ class UploadGuard:
             }
         ):
             return await self.app(scope, receive, send)
+        state = scope.setdefault("state", {})
+        state["started"] = time.perf_counter()
         limit = self.settings.max_upload_bytes + 1024 * 1024
         headers = dict(scope["headers"])
         try:
             length = int(headers.get(b"content-length", b"0"))
             if length < 0 or length > limit:
-                return await JSONResponse({"detail": "Request body is too large"}, 413)(
+                return await error_response(413, "Request body is too large", "invalidParseFile")(
                     scope, receive, send
                 )
         except ValueError:
-            return await JSONResponse({"detail": "Invalid Content-Length"}, 400)(
+            return await error_response(400, "Invalid Content-Length", "invalidParseFile")(
                 scope, receive, send
             )
         service = scope["app"].state.service
@@ -78,14 +80,11 @@ class UploadGuard:
                 admission.reserve_upload, scope["path"] == "/v2/parse/file"
             )
         except ServiceBusy:
-            return await JSONResponse(
-                {"detail": "Upload capacity is full"}, 503, headers={"Retry-After": "5"}
+            return await error_response(
+                503, "Upload capacity is full", headers={"Retry-After": "5"}
             )(scope, receive, send)
         except Exception:
-            return await JSONResponse({"detail": "Coordinator unavailable"}, 503)(
-                scope, receive, send
-            )
-        state = scope.setdefault("state", {})
+            return await error_response(503, "Coordinator unavailable")(scope, receive, send)
         state["upload_token"] = token
         state["upload_admission"] = admission
         state["upload_released"] = False
@@ -98,6 +97,11 @@ class UploadGuard:
             if finished:
                 return await receive()
             remaining = self.config.upload_seconds - (time.perf_counter() - started)
+            if scope["path"] == "/v2/parse/file":
+                remaining = min(
+                    remaining,
+                    self.settings.request_timeout - (time.perf_counter() - state["started"]),
+                )
             if remaining <= 0:
                 raise HTTPException(408, "Upload deadline exceeded")
             try:
@@ -165,8 +169,8 @@ class TransferGuard:
         try:
             token = await run_in_threadpool(store.reserve_transfer)
         except ServiceBusy:
-            return await JSONResponse(
-                {"detail": "Transfer capacity is full"}, 503, headers={"Retry-After": "1"}
+            return await error_response(
+                503, "Transfer capacity is full", headers={"Retry-After": "1"}
             )(scope, receive, send)
         started = False
 
@@ -183,6 +187,6 @@ class TransferGuard:
         except asyncio.TimeoutError:
             if started:
                 raise ConnectionError("Transfer deadline exceeded") from None
-            await JSONResponse({"detail": "Transfer deadline exceeded"}, 504)(scope, receive, send)
+            await error_response(504, "Transfer deadline exceeded")(scope, receive, send)
         finally:
             await run_in_threadpool(store.release_transfer, token)

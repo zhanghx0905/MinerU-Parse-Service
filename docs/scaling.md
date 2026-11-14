@@ -8,7 +8,7 @@ CPU API 协调任务，SQLite WAL 保存元数据，GPU worker 通过认证 HTTP
 
 同一调度主机可以启动多个 API 进程，共享同一个 SQLite 文件。WAL 仍然只有一个写入者，增加 API 进程不会增加 SQLite 写入并行度。当前调度端有单节点故障边界，没有跨节点多活或自动故障转移。
 
-API 镜像编译并校验 SQLite 3.51.3，运行时版本检查见 [sqlite_runtime.py](../app/sqlite_runtime.py)。不要用未通过此检查的系统 SQLite 代替部署镜像的运行库。
+API 镜像编译并校验 SQLite 3.51.3，运行时版本检查见 [runtime.py](../app/infrastructure/sqlite/runtime.py)。不要用未通过此检查的系统 SQLite 代替部署镜像的运行库。
 
 ## 扩容执行资源
 
@@ -36,7 +36,7 @@ GPU_ID=0 GPU_ID_B=1 docker compose -f compose.yaml -f compose.scale.yaml up -d \
 `MAX_PENDING`、`QUEUE_MAX_WORK`、`QUEUE_MAX_UPLOADS` 初值写入数据库，所有 API 进程启动时检查它们与配置一致。修改现有容量使用管理命令：
 
 ```bash
-docker compose exec mineru-api python -m app.queue_admin limits \
+docker compose exec mineru-api python -m app.cli.queue limits \
   --max-pending 64 --max-work 4096 --max-uploads 8
 ```
 
@@ -50,7 +50,9 @@ worker 收到 SIGTERM/SIGINT 后设置停止标志，各线程在当前任务结
 
 API 重启不删除已提交任务，但长时间无法续租会使正在运行的 worker 退出，并触发后续重试。计划维护时应先暂停上游新提交，再等待 `/health` 的 `queued` 和 `running` 均为 0，再停止或更新服务。当前没有内置的全局 drain 接口。
 
-升级模型或解析器时，先排空旧任务，统一更新模型文件、协调端和 worker 版本及 `MODEL_REVISION`，再启动预热和恢复流量。领取接口检查解析器版本与模型标识，但不验证实际权重的内容摘要，也不按旧版本任务自动选择不同 worker。
+升级模型或解析器时，先排空旧任务，统一更新模型文件、协调端和 worker 版本及 `MODEL_REVISION`，再启动预热和恢复流量。领取接口检查解析器版本、worker 协议版本与模型标识，但不验证实际权重的内容摘要，也不按旧版本任务自动选择不同 worker。
+
+1.1 → 1.2 会自动迁移数据库到 schema 2，API 与 worker 需要同步升级；已有 `.env` 的超时值不会自动改变。升级步骤见[FastGPT 契约](fastgpt.md#从-11-升级)。
 
 ## 文件存储与清理
 
@@ -65,7 +67,7 @@ API 重启不删除已提交任务，但长时间无法续租会使正在运行�
 数据库备份使用 SQLite 在线 backup API：
 
 ```bash
-docker compose exec mineru-api python -m app.queue_admin backup /data/backup.sqlite3
+docker compose exec mineru-api python -m app.cli.queue backup /data/backup.sqlite3
 ```
 
 这个命令只备份数据库，不包含 PDF、Markdown、模型或部署凭据。不要单独复制正在变化的数据库主文件代替在线备份；也不要把“在线数据库备份 + 任意时刻的对象复制”当成跨存储一致快照。
@@ -82,7 +84,7 @@ docker compose exec mineru-api python -m app.queue_admin backup /data/backup.sql
 ```bash
 docker compose stop mineru-worker mineru-api
 docker compose run --rm --no-deps --entrypoint python mineru-api \
-  -m app.queue_admin backup /data/backup.sqlite3
+  -m app.cli.queue backup /data/backup.sqlite3
 ```
 
 多解析单元要停止全部 worker；对象备份完成前保持 API 停止。维护容器复用同一持久卷，只运行备份命令，不启动 API 和清理循环。

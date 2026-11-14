@@ -2,120 +2,34 @@
 
 import json
 import math
-import sqlite3
 import time
-from contextlib import contextmanager
-from pathlib import Path
 from uuid import uuid4
 
-from .service import ServiceBusy
-from .sqlite_runtime import ensure_safe_wal
+from app.domain.jobs import (
+    AGING_SECONDS,
+    SHORT_JOB_MAX_PAGES,
+    TIER_WEIGHTS,
+    IdempotencyConflict,
+    LeaseLost,
+    ServiceBusy,
+    WorkBudgetExceeded,
+)
+from app.domain.parsing import ParseOptions
+from app.infrastructure.sqlite.database import QueueDatabase
+from app.infrastructure.sqlite.observability import record_completion
 
 BUCKETS = (0.01, 0.1, 0.5, 1, 5, 20, 60, 300, math.inf)
-TIERS = {"flash": 1, "basic": 2, "standard": 3, "advanced": 6}
-ACTIVE = ("queued", "running")
 
 
-class IdempotencyConflict(Exception):
-    pass
-
-
-class LeaseLost(Exception):
-    pass
-
-
-class WorkBudgetExceeded(ValueError):
-    pass
-
-
-class QueueStore:
+class QueueStore(QueueDatabase):
     def __init__(self, settings, queue_settings, clock=time.time):
-        ensure_safe_wal()
         self.settings = settings
         self.config = queue_settings
         self.clock = clock
-        Path(queue_settings.database).parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as connection:
-            mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
-            if mode != "wal":
-                raise ValueError("Queue requires a persistent local SQLite WAL database")
-            connection.executescript("""
-                CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-                CREATE TABLE IF NOT EXISTS jobs (
-                    id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
-                    dedup_key TEXT UNIQUE, idempotency_key TEXT UNIQUE,
-                    input_key TEXT NOT NULL, output_key TEXT,
-                    tier TEXT NOT NULL, encode_img INTEGER NOT NULL,
-                    pages INTEGER NOT NULL, cost INTEGER NOT NULL, lane TEXT NOT NULL,
-                    state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-                    lease_token TEXT, completed_token TEXT, lease_until REAL, worker_id TEXT,
-                    created REAL NOT NULL, queued REAL NOT NULL, available REAL NOT NULL,
-                    started REAL, finished REAL, cache_until REAL,
-                    error TEXT, result_bytes INTEGER NOT NULL DEFAULT 0,
-                    timings TEXT NOT NULL DEFAULT '{}'
-                );
-                CREATE TABLE IF NOT EXISTS idempotency (
-                    key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, job_id TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idempotency_job ON idempotency(job_id);
-                CREATE INDEX IF NOT EXISTS jobs_schedule ON jobs(state, available, queued);
-                CREATE INDEX IF NOT EXISTS jobs_retention ON jobs(state, finished);
-                CREATE INDEX IF NOT EXISTS jobs_cache_expiry ON jobs(cache_until)
-                    WHERE dedup_key IS NOT NULL;
-                CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, expires REAL NOT NULL);
-                CREATE TABLE IF NOT EXISTS waiters (id TEXT PRIMARY KEY, expires REAL NOT NULL);
-                CREATE TABLE IF NOT EXISTS transfers (
-                    id TEXT PRIMARY KEY, expires REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS garbage (key TEXT PRIMARY KEY);
-                CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, seen REAL NOT NULL);
-                CREATE TABLE IF NOT EXISTS metrics (
-                    stage TEXT NOT NULL, tier TEXT NOT NULL, count INTEGER NOT NULL,
-                    total REAL NOT NULL, buckets TEXT NOT NULL, PRIMARY KEY(stage, tier)
-                );
-                CREATE TABLE IF NOT EXISTS counters (
-                    event TEXT PRIMARY KEY, value INTEGER NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS limits (
-                    id INTEGER PRIMARY KEY CHECK(id=1), max_pending INTEGER NOT NULL,
-                    max_work INTEGER NOT NULL, max_uploads INTEGER NOT NULL
-                );
-            """)
-        with self.transaction() as connection:
-            version = connection.execute("SELECT version FROM schema_version").fetchone()
-            if version is None:
-                connection.execute("INSERT INTO schema_version VALUES (1)")
-            elif version[0] != 1:
-                raise ValueError("Unsupported queue schema version")
-            values = (settings.max_pending, queue_settings.max_work, queue_settings.max_uploads)
-            connection.execute("INSERT OR IGNORE INTO limits VALUES (1,?,?,?)", values)
-            stored = connection.execute(
-                "SELECT max_pending,max_work,max_uploads FROM limits WHERE id=1"
-            ).fetchone()
-            if tuple(stored) != values:
-                raise ValueError("Coordinator processes must use identical queue limits")
-
-    @contextmanager
-    def connect(self):
-        connection = sqlite3.connect(self.config.database, timeout=5, isolation_level=None)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=5000")
-        connection.execute("PRAGMA synchronous=FULL")
-        try:
-            yield connection
-        finally:
-            connection.close()
-
-    @contextmanager
-    def transaction(self):
-        with self.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                yield connection
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
+        super().__init__(
+            queue_settings.database,
+            (settings.max_pending, queue_settings.max_work, queue_settings.max_uploads),
+        )
 
     @staticmethod
     def _garbage(connection, key):
@@ -280,9 +194,11 @@ class QueueStore:
         disable_cache=False,
         idempotency_key=None,
         upload_token=None,
+        options=None,
     ):
         now = self.clock()
-        cost = pages * TIERS[tier]
+        options = options or ParseOptions()
+        cost = pages * TIER_WEIGHTS[tier]
         with self.transaction() as connection:
             self._sweep(connection, now)
             limits = connection.execute("SELECT * FROM limits WHERE id=1").fetchone()
@@ -326,7 +242,7 @@ class QueueStore:
             ).fetchone()
             if count >= limits["max_pending"] or work + cost > limits["max_work"]:
                 raise ServiceBusy("Parse queue is full; retry later")
-            lane = "short" if pages <= 8 else "bulk"
+            lane = "short" if pages <= SHORT_JOB_MAX_PAGES else "bulk"
             reserved = min(1, limits["max_pending"] - 1)
             if lane == "bulk" and count >= limits["max_pending"] - reserved:
                 raise ServiceBusy("Bulk queue is full; retry later")
@@ -335,8 +251,8 @@ class QueueStore:
             dedup = fingerprint if not disable_cache else None
             connection.execute(
                 "INSERT INTO jobs (id,fingerprint,dedup_key,idempotency_key,input_key,"
-                "tier,encode_img,pages,cost,lane,state,created,queued,available) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,'queued',?,?,?)",
+                "tier,encode_img,pages,cost,lane,state,created,queued,available,parse_options) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,'queued',?,?,?,?)",
                 (
                     job_id,
                     fingerprint,
@@ -351,6 +267,7 @@ class QueueStore:
                     now,
                     now,
                     now,
+                    options.to_json(),
                 ),
             )
             if idempotency_key:
@@ -379,7 +296,7 @@ class QueueStore:
                 "SELECT * FROM jobs WHERE state='queued' AND available<=? "
                 "ORDER BY CASE WHEN queued<? THEN 0 WHEN lane='short' THEN 1 ELSE 2 END,queued,id "
                 "LIMIT 1",
-                (now, now - 60),
+                (now, now - AGING_SECONDS),
             ).fetchone()
             if not job:
                 return None
@@ -468,6 +385,7 @@ class QueueStore:
             self._observe(connection, job["tier"], timings)
             self._observe(connection, job["tier"], {"job.total": now - job["created"]})
             self._counter(connection, "succeeded")
+            record_completion(connection, job["tier"], pages, timings)
             self._garbage(connection, job["input_key"])
             return True
 

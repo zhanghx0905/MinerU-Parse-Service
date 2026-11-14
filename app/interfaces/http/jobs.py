@@ -2,7 +2,6 @@
 
 import json
 import math
-import secrets
 import time
 from typing import Annotated
 
@@ -11,9 +10,11 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse, Response
 
-from .jobs import LeaseLost
-from .metrics import STAGES, render_metrics
-from .queue_service import QueueService
+from app.application.queue import QueueService
+from app.domain.jobs import LeaseLost
+from app.domain.parsing import ParseOptions
+from app.infrastructure.metrics import STAGES, render_metrics
+from app.interfaces import WORKER_PROTOCOL_VERSION
 
 router = APIRouter()
 JobID = Annotated[str, Path(pattern=r"^[a-f0-9]{32}$")]
@@ -28,20 +29,24 @@ def coordinator(request):
 
 
 def public_job(job):
-    return {
-        key: job[key]
-        for key in (
-            "id",
-            "state",
-            "tier",
-            "encode_img",
-            "pages",
-            "attempts",
-            "created",
-            "finished",
-            "error",
-        )
-    } | {"status_url": f"/jobs/{job['id']}", "result_url": f"/jobs/{job['id']}/result"}
+    return (
+        {
+            key: job[key]
+            for key in (
+                "id",
+                "state",
+                "tier",
+                "encode_img",
+                "pages",
+                "attempts",
+                "created",
+                "finished",
+                "error",
+            )
+        }
+        | {"parse_options": ParseOptions.from_json(job["parse_options"]).to_dict()}
+        | {"status_url": f"/jobs/{job['id']}", "result_url": f"/jobs/{job['id']}/result"}
+    )
 
 
 @router.get("/jobs/{job_id}")
@@ -84,6 +89,7 @@ class Claim(BaseModel):
     worker_id: str = Field(pattern=r"^[a-f0-9]{32}$")
     model_revision: str = Field(max_length=200)
     mineru_version: str = Field(max_length=30)
+    protocol_version: int = 1
 
 
 @router.post("/internal/worker/claim")
@@ -95,6 +101,8 @@ async def claim(body: Claim, request: Request):
         "mineru"
     ):
         raise HTTPException(409, "Worker model or parser version does not match coordinator")
+    if body.protocol_version != WORKER_PROTOCOL_VERSION:
+        raise HTTPException(409, "Worker protocol does not support parse options; upgrade worker")
     job = await run_in_threadpool(service.store.claim, body.worker_id)
     if job is None:
         return Response(status_code=204)
@@ -102,6 +110,8 @@ async def claim(body: Claim, request: Request):
         key: job[key] for key in ("id", "lease_token", "tier", "encode_img", "pages", "attempts")
     } | {
         "encode_img": bool(job["encode_img"]),
+        "parse_options": ParseOptions.from_json(job["parse_options"]).to_dict(),
+        "protocol_version": WORKER_PROTOCOL_VERSION,
         "lease_seconds": service.config.lease_seconds,
         "max_result_bytes": service.config.max_result_bytes,
     }
@@ -163,9 +173,10 @@ async def complete(job_id: JobID, request: Request, token: Lease, pages: int):
         if len(content) > service.config.max_result_bytes:
             raise HTTPException(413, "Result exceeds size limit")
     try:
-        if not content.decode("utf-8").strip():
-            raise ValueError
-    except (ValueError, UnicodeDecodeError) as exc:
+        # A valid document may have no visible text after explicitly requested
+        # filtering (for example, an appendix-only PDF with keep_appendix=false).
+        content.decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise HTTPException(400, "Result must contain UTF-8 Markdown") from exc
     key = f"results/{token}.md"
     stored_at = time.perf_counter()
@@ -187,21 +198,3 @@ async def fail(job_id: JobID, request: Request, token: Lease):
     except LeaseLost as exc:
         raise HTTPException(409, "Task lease is no longer valid") from exc
     return {"accepted": True}
-
-
-class WorkerAuth:
-    """Reject unauthenticated worker requests before reading their bodies."""
-
-    def __init__(self, app, token):
-        self.app = app
-        self.token = token
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"].startswith("/internal/"):
-            supplied = dict(scope["headers"]).get(b"authorization", b"")
-            expected = ("Bearer " + self.token).encode()
-            if not self.token or not secrets.compare_digest(supplied, expected):
-                return await JSONResponse({"detail": "Worker authentication required"}, 401)(
-                    scope, receive, send
-                )
-        await self.app(scope, receive, send)

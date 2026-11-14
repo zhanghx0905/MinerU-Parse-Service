@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from .queue_config import QueueSettings
+from app.config import QueueSettings
 
 _KEY = re.compile(r"(?:inputs|results)/[a-f0-9]{32}\.(?:pdf|md)\Z")
 

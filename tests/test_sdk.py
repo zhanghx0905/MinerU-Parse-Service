@@ -1,6 +1,6 @@
 """Exercise the installed MinerU SDK using its native-text flash path."""
 
-from app.engine import MinerUEngine, markdown_without_images
+from app.infrastructure.mineru.engine import MinerUEngine, markdown_without_images
 from scripts.smoke_test import sample_pdf
 
 

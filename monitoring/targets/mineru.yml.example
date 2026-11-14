@@ -1,0 +1,3 @@
+- targets: ["mineru-host:3888"]
+  labels:
+    service: mineru

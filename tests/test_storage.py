@@ -2,7 +2,7 @@ import io
 
 import pytest
 
-from app.storage import LocalStorage, S3Storage
+from app.infrastructure.storage import LocalStorage, S3Storage
 
 
 def test_local_storage_rejects_paths_and_preserves_data(tmp_path):

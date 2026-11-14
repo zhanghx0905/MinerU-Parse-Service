@@ -10,6 +10,8 @@ from time import perf_counter
 from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, HistogramMetricFamily
 
+from app.infrastructure.sqlite.observability import processing_rows
+
 STAGES = frozenset(
     {
         "api.upload",
@@ -21,6 +23,7 @@ STAGES = frozenset(
         "markdown.render",
         "job.total",
         "worker.download",
+        "worker.parse",
         "model.initialize",
         "vlm.http",
         "vlm.queue",
@@ -93,7 +96,7 @@ class QueueCollector:
         self.store = store
 
     def collect(self):
-        from .jobs import BUCKETS
+        from app.infrastructure.sqlite.jobs import BUCKETS
 
         rows, counters = self.store.metric_rows()
         durations = HistogramMetricFamily(
@@ -122,6 +125,25 @@ class QueueCollector:
             metric = GaugeMetricFamily("mineru_" + name, "Coordinator " + name)
             metric.add_metric([], stats[name])
             yield metric
+        totals = processing_rows(self.store)
+        for name, field, description in (
+            ("processed_pages", "completed_pages", "Successfully published PDF pages"),
+            ("processing_seconds", "parse_seconds", "Execution wall time of measured successes"),
+            ("measured_pages", "measured_pages", "Published pages paired with execution timings"),
+        ):
+            metric = CounterMetricFamily("mineru_" + name, description, labels=["tier"])
+            for row in totals:
+                metric.add_metric([row["tier"]], row[field])
+            yield metric
+        speed = GaugeMetricFamily(
+            "mineru_parse_seconds_per_page",
+            "Cumulative execution seconds per measured page",
+            labels=["tier"],
+        )
+        for row in totals:
+            if row["measured_pages"]:
+                speed.add_metric([row["tier"]], row["parse_seconds"] / row["measured_pages"])
+        yield speed
 
 
 def render_metrics(store):

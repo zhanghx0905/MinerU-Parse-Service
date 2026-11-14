@@ -19,7 +19,7 @@ RUN python /tmp/install_dependencies.py \
     && python -m pip install --no-cache-dir 'boto3>=1.35,<2'
 COPY app ./app
 RUN python -m pip install --no-cache-dir --no-deps --no-build-isolation . \
-    && python -c "from app.sqlite_runtime import ensure_safe_wal; ensure_safe_wal()"
+    && python -c "from app.infrastructure.sqlite.runtime import ensure_safe_wal; ensure_safe_wal()"
 EXPOSE 3000
 HEALTHCHECK --interval=15s --timeout=5s --start-period=15s \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/health', timeout=3)"

@@ -6,17 +6,16 @@ from uuid import uuid4
 import httpx
 from fastapi.testclient import TestClient
 
-from app.config import Settings
-from app.engine import ParseOutput
+from app.config import QueueSettings, Settings
+from app.domain.parsing import ParseOutput
+from app.interfaces.gateway import create_gateway
+from app.interfaces.worker import Worker
 from app.main import create_app
-from app.queue_config import QueueSettings
-from app.vlm_gateway import create_gateway
-from app.worker import Worker
 from tests.test_queue import pdf
 
 
 class StubEngine:
-    def parse(self, _payload, encode_img, tier):
+    def parse(self, _payload, encode_img, tier, options):
         return ParseOutput(f"{tier}:{encode_img}", 1, {"sdk.total": 0.1})
 
     def close(self):
@@ -47,6 +46,7 @@ def test_worker_executes_through_real_http_protocol(tmp_path):
         assert result.status_code == 200
         assert result.json()["markdown"] == "flash:False"
         assert 'stage="sdk.total"' in client.get("/metrics").text
+        assert 'stage="worker.parse"' in client.get("/metrics").text
 
 
 def test_invalid_measurements_and_wrong_version_are_rejected(tmp_path):
@@ -73,6 +73,7 @@ def test_invalid_measurements_and_wrong_version_are_rejected(tmp_path):
                 "worker_id": uuid4().hex,
                 "model_revision": config.model_revision,
                 "mineru_version": version("mineru"),
+                "protocol_version": 2,
             },
         ).json()
         headers = {
@@ -144,7 +145,7 @@ def test_sdk_stage_capture_uses_installed_sdk_timer(monkeypatch):
 
     from mineru.utils.timing import stage_timer
 
-    from app.metrics import record_sdk_stages
+    from app.infrastructure.metrics import record_sdk_stages
 
     monkeypatch.setenv("MINERU_PROFILE_STAGES", "true")
     timings = {}
@@ -165,6 +166,10 @@ def test_worker_stops_stale_gpu_execution():
             return ParseOutput("stale", 1)
 
     class LostClient:
+        def request(self, method, path, **kwargs):
+            assert method == "GET"
+            return self.get(path, **kwargs)
+
         def get(self, *_args, **_kwargs):
             return httpx.Response(200, content=b"pdf", request=httpx.Request("GET", "http://test"))
 
@@ -188,6 +193,7 @@ def test_worker_stops_stale_gpu_execution():
             "tier": "standard",
             "encode_img": True,
             "max_result_bytes": 100,
+            "parse_options": {},
         }
     )
     assert exits == [70]

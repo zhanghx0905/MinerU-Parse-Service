@@ -7,10 +7,11 @@ import pytest
 from fastapi.testclient import TestClient
 from pypdf import PdfWriter
 
+from app.application.parsing import ParseService
 from app.config import Settings
-from app.engine import ParseOutput
+from app.domain.jobs import ServiceBusy
+from app.domain.parsing import ParseOutput
 from app.main import create_app
-from app.service import ParseService, ServiceBusy
 
 
 def make_pdf(pages=1):
@@ -27,7 +28,7 @@ class FakeEngine:
         self.calls = 0
         self.closed = False
 
-    def parse(self, payload, encode_img, tier=None):
+    def parse(self, payload, encode_img, tier=None, options=None):
         self.calls += 1
         return ParseOutput(
             "# Result" + (" ![](data:image/png;base64,YQ==)" if encode_img else ""), 1
@@ -96,11 +97,11 @@ def test_encrypted_pdf():
 
 def test_failure_returns_500_and_next_request_recovers():
     class FailingEngine(FakeEngine):
-        def parse(self, payload, encode_img, tier=None):
+        def parse(self, payload, encode_img, tier=None, options=None):
             if not self.calls:
                 self.calls += 1
                 raise RuntimeError("private path /secret/file")
-            return super().parse(payload, encode_img, tier)
+            return super().parse(payload, encode_img, tier, options)
 
     with TestClient(create_app(engine=FailingEngine())) as c:
         upload = {"file": ("test.pdf", make_pdf())}
@@ -117,9 +118,9 @@ def test_timeout_keeps_queue_slot_and_coalesces_work():
             super().__init__()
             self.release = threading.Event()
 
-        def parse(self, payload, encode_img, tier=None):
+        def parse(self, payload, encode_img, tier=None, options=None):
             self.release.wait(5)
-            return super().parse(payload, encode_img, tier)
+            return super().parse(payload, encode_img, tier, options)
 
     async def scenario():
         engine = BlockingEngine()
@@ -179,7 +180,7 @@ def test_parallel_requests_keep_results_separate():
     class ParallelEngine(FakeEngine):
         barrier = threading.Barrier(2)
 
-        def parse(self, payload, encode_img, tier=None):
+        def parse(self, payload, encode_img, tier=None, options=None):
             self.barrier.wait(timeout=3)
             return ParseOutput(payload.decode(), 1)
 

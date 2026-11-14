@@ -21,6 +21,11 @@ samples/
 *.log
 *.json
 *.jsonl
+!monitoring/grafana/dashboards/*.json
+monitoring/targets/*.yml
+monitoring/prometheus_data/
+monitoring/grafana_data/
+monitoring/maintenance/
 *.csv
 *.pdf
 *.pem

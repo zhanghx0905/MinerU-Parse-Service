@@ -1,27 +1,24 @@
 """Bounded scheduling, request coalescing and byte-limited result caching."""
 
 import asyncio
-import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 from cachetools import TTLCache
 
-from .config import Settings
-from .engine import MinerUEngine, ParseOutput
+from app.application.fingerprints import content_fingerprint
+from app.config import Settings
+from app.domain.jobs import ServiceBusy
+from app.domain.parsing import ParseOptions, ParseOutput
 
 logger = logging.getLogger(__name__)
 
 
-class ServiceBusy(Exception):
-    pass
-
-
 class ParseService:
-    def __init__(self, settings: Settings, engine=None):
+    def __init__(self, settings: Settings, engine):
         self.settings = settings
-        self.engine = engine or MinerUEngine(settings.tier)
+        self.engine = engine
         self.executor = ThreadPoolExecutor(
             max_workers=settings.parse_workers, thread_name_prefix="mineru"
         )
@@ -30,7 +27,7 @@ class ParseService:
             ttl=settings.cache_ttl,
             getsizeof=lambda result: len(result.markdown.encode("utf-8")) + 64,
         )
-        self.inflight: dict[tuple, asyncio.Task] = {}
+        self.inflight: dict[str, asyncio.Task] = {}
         self.tasks: set[asyncio.Task] = set()
         self.closed = False
         self.last_error: str | None = None
@@ -42,10 +39,18 @@ class ParseService:
         self.ready = True
 
     async def parse(
-        self, payload: bytes, encode_img: bool, disable_cache: bool, tier: str | None = None
+        self,
+        payload: bytes,
+        encode_img: bool,
+        disable_cache: bool,
+        tier: str | None = None,
+        options: ParseOptions | None = None,
+        *,
+        timeout: float | None = None,
     ):
         tier = tier or self.settings.tier
-        key = (hashlib.sha256(payload).hexdigest(), encode_img, tier)
+        options = options or ParseOptions()
+        key = content_fingerprint(payload, tier, encode_img, options)
         if self.closed:
             raise ServiceBusy("Service is shutting down")
         if not disable_cache and key in self.cache:
@@ -54,18 +59,23 @@ class ParseService:
         if task is None:
             if len(self.tasks) >= self.settings.max_pending:
                 raise ServiceBusy("Parse queue is full; retry later")
-            task = asyncio.create_task(self._run(payload, encode_img, key, not disable_cache, tier))
+            task = asyncio.create_task(
+                self._run(payload, encode_img, key, not disable_cache, tier, options)
+            )
             self.tasks.add(task)
             if not disable_cache:
                 self.inflight[key] = task
             task.add_done_callback(partial(self._finished, key=key))
         # A timeout/disconnect must not drop a slot while GPU work is still running.
-        return await asyncio.wait_for(asyncio.shield(task), timeout=self.settings.request_timeout)
+        return await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=self.settings.request_timeout if timeout is None else timeout,
+        )
 
-    async def _run(self, payload, encode_img, key, cache_result, tier) -> ParseOutput:
+    async def _run(self, payload, encode_img, key, cache_result, tier, options) -> ParseOutput:
         try:
             result = await asyncio.get_running_loop().run_in_executor(
-                self.executor, self.engine.parse, payload, encode_img, tier
+                self.executor, self.engine.parse, payload, encode_img, tier, options
             )
             self.last_error = None
             self.completed += 1

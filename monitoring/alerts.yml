@@ -1,0 +1,29 @@
+groups:
+  - name: mineru
+    rules:
+      - alert: MinerUUnavailable
+        expr: up{job="mineru"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MinerU {{ $labels.instance }} 指标采集失败"
+          description: "连续两分钟无法采集，请检查 API、网络和监控目标配置。"
+
+      - alert: MinerUQueueDelayed
+        expr: mineru_oldest_wait_seconds{job="mineru"} > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MinerU {{ $labels.instance }} 持续排队"
+          description: "最老任务等待超过一分钟，且该情况已持续五分钟。"
+
+      - alert: MinerUNoWorkers
+        expr: (mineru_workers{job="mineru"} == 0) and on(job, instance) (up{job="mineru"} == 1)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MinerU {{ $labels.instance }} 没有活跃 worker"
+          description: "API 可采集，但两分钟内未观测到活跃 worker，请检查解析进程和凭据。"

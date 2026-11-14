@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.api
-    image: ${API_IMAGE:-mineru-api:1.1.0}
+    image: ${API_IMAGE:-mineru-api:1.2.0}
     init: true
     restart: unless-stopped
     command: ["app.main:app", "--host", "0.0.0.0", "--port", "3000", "--workers", "${API_PROCESSES:-1}", "--no-access-log"]
@@ -26,7 +26,8 @@ services:
       MAX_PENDING: ${MAX_PENDING:-64}
       MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-52428800}
       MAX_PAGES: ${MAX_PAGES:-1000}
-      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-6000}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-540}
+      PDF_API_KEY: ${PDF_API_KEY:-}
       CACHE_BYTES: ${CACHE_BYTES:-134217728}
       CACHE_TTL: ${CACHE_TTL:-3600}
       QUEUE_MAX_ATTEMPTS: ${QUEUE_MAX_ATTEMPTS:-3}
@@ -54,8 +55,8 @@ services:
       args:
         VLLM_IMAGE: ${VLLM_IMAGE:-vllm/vllm-openai:v0.29.0}
         SMALL_BACKEND: ${SMALL_BACKEND:-torch}
-    image: ${WORKER_IMAGE:-mineru-worker:1.1.0}
-    entrypoint: ["python3", "-m", "app.worker"]
+    image: ${WORKER_IMAGE:-mineru-worker:1.2.0}
+    entrypoint: ["python3", "-m", "app.interfaces.worker"]
     init: true
     restart: unless-stopped
     depends_on:
@@ -98,8 +99,8 @@ services:
               capabilities: [gpu]
 
   mineru-vlm-gateway:
-    image: ${API_IMAGE:-mineru-api:1.1.0}
-    command: ["app.vlm_gateway:app", "--host", "0.0.0.0", "--port", "8001", "--no-access-log"]
+    image: ${API_IMAGE:-mineru-api:1.2.0}
+    command: ["app.interfaces.gateway:app", "--host", "0.0.0.0", "--port", "8001", "--no-access-log"]
     init: true
     restart: unless-stopped
     depends_on:
