@@ -8,7 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 
-from app.domain.parsing import DocumentLimitExceeded, InvalidDocument
+from app.models import DocumentLimitExceeded, InvalidDocument
 
 logger = logging.getLogger(__name__)
 

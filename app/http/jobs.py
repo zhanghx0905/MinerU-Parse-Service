@@ -3,6 +3,7 @@
 import json
 import math
 import time
+from importlib.metadata import version
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Header, HTTPException, Path, Request
@@ -10,11 +11,8 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse, Response
 
-from app.application.queue import QueueService
-from app.domain.jobs import LeaseLost
-from app.domain.parsing import ParseOptions
-from app.infrastructure.metrics import STAGES, render_metrics
-from app.interfaces import WORKER_PROTOCOL_VERSION
+from app.models import STAGES, WORKER_PROTOCOL_VERSION, LeaseLost, ParseOptions
+from app.queue.metrics import read_observability, render_metrics
 
 router = APIRouter()
 JobID = Annotated[str, Path(pattern=r"^[a-f0-9]{32}$")]
@@ -22,10 +20,7 @@ Lease = Annotated[str, Header(alias="X-Task-Lease", pattern=r"^[a-f0-9]{32}$")]
 
 
 def coordinator(request):
-    service = request.app.state.service
-    if not isinstance(service, QueueService):
-        raise HTTPException(503, "Durable queue mode is not enabled")
-    return service
+    return request.app.state.service
 
 
 def public_job(job):
@@ -96,8 +91,6 @@ class Claim(BaseModel):
 
 @router.post("/internal/worker/claim")
 async def claim(body: Claim, request: Request):
-    from importlib.metadata import version
-
     service = coordinator(request)
     if body.model_revision != service.config.model_revision or body.mineru_version != version(
         "mineru"
@@ -130,7 +123,7 @@ async def leased_job(request, job_id, token):
 
 @router.post("/internal/jobs/{job_id}/heartbeat")
 async def heartbeat(job_id: JobID, request: Request, token: Lease):
-    service, _ = await leased_job(request, job_id, token)
+    service = coordinator(request)
     try:
         await run_in_threadpool(service.store.heartbeat, job_id, token)
     except LeaseLost as exc:
@@ -184,9 +177,7 @@ async def complete(job_id: JobID, request: Request, token: Lease, pages: int):
     stored_at = time.perf_counter()
     await run_in_threadpool(service.storage.put, key, bytes(content))
     timings["storage.result"] = time.perf_counter() - stored_at
-    accepted = await run_in_threadpool(
-        service.store.complete, job_id, token, pages, timings, len(content)
-    )
+    accepted = await run_in_threadpool(service.store.complete, job_id, token, pages, timings)
     if not accepted:
         raise HTTPException(409, "Task lease or page count is no longer valid")
     return {"accepted": True}
@@ -194,9 +185,32 @@ async def complete(job_id: JobID, request: Request, token: Lease, pages: int):
 
 @router.post("/internal/jobs/{job_id}/fail")
 async def fail(job_id: JobID, request: Request, token: Lease):
-    service, _ = await leased_job(request, job_id, token)
+    service = coordinator(request)
     try:
         await run_in_threadpool(service.store.fail, job_id, token)
     except LeaseLost as exc:
         raise HTTPException(409, "Task lease is no longer valid") from exc
     return {"accepted": True}
+
+
+@router.get("/stats")
+async def stats(request: Request):
+    return await run_in_threadpool(read_observability, coordinator(request).store)
+
+
+@router.get("/health")
+async def health(request: Request):
+    service = coordinator(request)
+    snapshot = await run_in_threadpool(service.store.stats)
+    return {
+        "status": "ok",
+        "mode": "queue",
+        "service_version": version("mineru-pdf-service"),
+        "mineru_version": version("mineru"),
+        "tier": service.settings.tier,
+        "model_ready": snapshot["workers"] > 0,
+        "last_error": service.last_error,
+        "pending": snapshot["queued"] + snapshot["running"],
+        "completed": snapshot["succeeded"],
+        **snapshot,
+    }

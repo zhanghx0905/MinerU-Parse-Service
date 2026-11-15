@@ -15,10 +15,10 @@ import pytest
 import uvicorn
 
 from app.config import QueueSettings, Settings
-from app.domain.parsing import ParseOutput
-from app.interfaces.worker_pool import WorkerPool, run_worker_process
 from app.main import create_app
-from tests.test_queue import pdf
+from app.models import ParseOutput
+from app.worker import WorkerPool, run_worker_process
+from tests.helpers import make_pdf as pdf
 
 
 class BlockingEngine:
@@ -47,7 +47,7 @@ def stub_worker(settings, queue_settings):
             }
         )
     )
-    run_worker_process(settings, queue_settings, engine=BlockingEngine())
+    run_worker_process(settings, queue_settings, parse=BlockingEngine().parse)
 
 
 def stub_pool(settings, queue_settings):
@@ -68,9 +68,7 @@ def test_spawn_pool_reserves_vip_replaces_only_crashed_child_and_drains(tmp_path
     gate = tmp_path / "gate"
     gate.mkdir()
     monkeypatch.setenv("MINERU_TEST_GATE_DIR", str(gate))
-    settings = Settings(
-        service_mode="queue", preload_models=False, parse_workers=4, priority_workers=1
-    )
+    settings = Settings(preload_models=False, parse_workers=4, priority_workers=1)
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     port = listener.getsockname()[1]

@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import io
+import os
 import statistics
 import time
 from pathlib import Path
@@ -45,6 +46,9 @@ async def run(args):
     started = time.perf_counter()
     async with httpx.AsyncClient(
         base_url=args.url.rstrip("/"),
+        headers={"Authorization": "Bearer " + os.environ["PDF_API_KEY"]}
+        if os.getenv("PDF_API_KEY")
+        else {},
         timeout=60,
         trust_env=False,
         limits=httpx.Limits(max_connections=args.max_inflight + 4),

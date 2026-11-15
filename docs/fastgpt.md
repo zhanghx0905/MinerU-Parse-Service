@@ -14,8 +14,6 @@
 | `GET /stats` | 全局队列和解析速度快照 |
 | `GET /metrics` | Prometheus 指标 |
 
-`/jobs` 及持久查询需要 `SERVICE_MODE=queue`，默认 Compose 使用此模式。`inline` 兼容模式只提供进程内同步解析，不支持持久幂等键或优先级调度。
-
 两种 POST 均使用 multipart 的 `file` 字段上传 PDF，接受相同参数。
 
 | Query 参数 | 默认值 | 含义 |
@@ -23,7 +21,7 @@
 | `tier` | `PARSE_TIER`，默认 standard | flash / basic / standard / advanced |
 | `priority` | 0 | 0 普通，1 高优；复用在途任务时只提升、不降低优先级 |
 | `encode_img` | true | 是否在 Markdown 中内嵌图片资源 |
-| `disable_cache` | false | 跳过内容缓存和在途去重；显式幂等键仍有效 |
+| `disable_cache` | false | 跳过结果复用和在途去重，始终创建新任务 |
 
 | Multipart 表单字段 | 默认值 | 输出规则 |
 | --- | --- | --- |
@@ -34,17 +32,17 @@
 
 过滤作用于 SDK 结构化结果，附录边界依赖标题识别与层级。未识别成标题的内容不会按正文关键词删除。开关不会自动提升解析档位；`encode_img=false` 仍保留其他开关允许的正文、表格和公式。
 
-## 异步任务与幂等
+## 异步任务与内容复用
 
 ```bash
-curl --fail-with-body -H 'Idempotency-Key: request-001' -F 'file=@example.pdf' \
+curl --fail-with-body -F 'file=@example.pdf' \
   'http://127.0.0.1:3888/jobs?tier=standard&priority=1'
 # 使用响应中的 status_url 和 result_url 查询。
 ```
 
-相同内容、输出选项、解析器及模型版本默认合并在途任务或复用结果。`Idempotency-Key` 为 1–128 个字符：同一键和指纹返回原任务，同一键用于不同输入返回 409。不同键可以共享一次解析。
+相同内容、输出选项、解析器及模型版本默认合并在途任务，并在结果保留期内复用成功任务，默认保留一天。失败任务不参与复用，修复原因后直接重新提交。使用 `disable_cache=true` 强制新建任务，重复提交会产生不同 ID。
 
-失败任务仍由原幂等键指向，直到任务保留期清理；需要重新提交时使用新键。若还需跳过内容复用，使用 `disable_cache=true`。当前没有取消或原任务 ID 重新排队接口。
+服务不读取客户端 `Idempotency-Key`。提交响应丢失时，相同内容的默认重试可复用任务；禁用复用后的重试可能创建多个任务。当前没有取消或原任务 ID 重新排队接口。
 
 ## 同步结果与超时
 
@@ -63,7 +61,7 @@ curl --fail-with-body --max-time 600 -F 'file=@example.pdf' \
 
 `pages` 为原 PDF 页数；过滤附录不会减少它。过滤后允许空 Markdown。`duration` 单位为秒：同步接口计算服务端接收、校验、提交和等待的总时间；异步结果计算任务入队至完成的时间。
 
-默认 `REQUEST_TIMEOUT=540` 秒，同步等待扣除上传、校验和提交耗时。超时返回 504，并附 `id / status_url / result_url`、`Location` 和 `X-Task-ID`；已经入队的任务继续执行。调用方需要自行查询结果，网络断开不代表任务未提交；不明确的提交响应应使用相同幂等键重试。
+默认 `REQUEST_TIMEOUT=540` 秒，同步等待扣除上传、校验和提交耗时。超时返回 504，并附 `id / status_url / result_url`、`Location` 和 `X-Task-ID`；已经入队的任务继续执行。调用方需要自行查询结果，网络断开不代表任务未提交；默认重试可依靠内容指纹复用；`disable_cache=true` 的提交需自行处理重复任务。
 
 ## 鉴权与 FastGPT
 
@@ -82,10 +80,10 @@ FastGPT 的 `customPdfParse.url` 指向 `/v2/parse/file`，`customPdfParse.key` 
 | 400 | 非 PDF、损坏、加密或空文档 | 修正输入 |
 | 401 | 凭据缺失或错误 | 使用对应接口的凭据 |
 | 404 | 任务不存在或已清理 | 检查 ID 和保留期 |
-| 409 | 幂等键冲突，或读取失败任务的结果 | 更换逻辑请求键或处理解析失败 |
-| 413 | 文件大小、页数超限 | 调整输入或服务配置；默认最多 50 MiB、1000 页 |
+| 409 | 读取失败任务的结果 | 处理解析失败，修正原因后重新提交 |
+| 413 | 文件大小、页数超限 | 调整输入或服务配置；默认最多 200 MiB、2000 页 |
 | 422 | 参数格式错误 | 修正参数 |
 | 503 | 上传、同步等待、传输或队列容量满 | 按 `Retry-After` 退避 |
 | 504 | 同步等待超时 | 使用响应中的任务地址继续查询 |
 
-稳定诊断码包括 `pdfEncrypted`、`pdfCorrupted`、`unsupportedParseFileType`、`invalidParseFile`、`pdfParseFailed`。`PDF exceeds 1000 pages` 是入口 413 校验，不占用解析 worker；入队后的 `parse_error`、租约失效和存储错误见[调度与故障处理](scheduling.md#5-异常情况如何处理)。
+稳定诊断码包括 `pdfEncrypted`、`pdfCorrupted`、`unsupportedParseFileType`、`invalidParseFile`、`pdfParseFailed`。`PDF exceeds 2000 pages` 是入口 413 校验，不占用解析 worker；入队后的 `parse_error`、租约失效和存储错误见[调度与故障处理](scheduling.md#5-异常情况如何处理)。

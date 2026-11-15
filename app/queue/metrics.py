@@ -1,94 +1,58 @@
-"""Bounded-label metrics and optional SDK diagnostic timings."""
+"""Queue read model and completion totals; updates share the task's commit transaction."""
 
 import json
-import re
-import threading
-from contextlib import contextmanager
-from contextvars import ContextVar
-from time import perf_counter
 
 from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, HistogramMetricFamily
 
-from app.infrastructure.sqlite.observability import processing_rows
 
-STAGES = frozenset(
-    {
-        "api.upload",
-        "api.validate",
-        "storage.input",
-        "storage.result",
-        "queue.wait",
-        "sdk.total",
-        "markdown.render",
-        "job.total",
-        "worker.download",
-        "worker.parse",
-        "model.initialize",
-        "vlm.http",
-        "vlm.queue",
-        *(
-            "pdf." + name
-            for name in (
-                "prepare",
-                "cleanup",
-                "geometry",
-                "ocr_detection",
-                "ocr_recognition",
-                "text_fill",
-                "formulas",
-                "table_recognition",
-                "formula_numbers",
-                "render",
-                "layout",
-                "table_orientation",
-                "native_tables",
-                "seals",
-                "image_assets",
-            )
-        ),
+def processing_rows(store):
+    with store.connect() as connection:
+        return [dict(row) for row in connection.execute("SELECT * FROM processing_totals")]
+
+
+def read_observability(store):
+    """Separate execution speed from recent wall-clock throughput across all workers."""
+    states = store.stats()
+    rows = processing_rows(store)
+    totals = {
+        key: sum(row[key] for row in rows)
+        for key in (
+            "completed_jobs",
+            "completed_pages",
+            "measured_jobs",
+            "measured_pages",
+            "parse_seconds",
+        )
     }
-)
-_current = ContextVar("mineru_stage_timings", default=None)
-_installed = False
-_sink_lock = threading.Lock()
-_pattern = re.compile(r"MinerU stage: name=([a-z_.]+), elapsed_s=([0-9.]+), pid=\d+")
-
-
-def _sink(message):
-    target = _current.get()
-    if target is None:
-        return
-    match = _pattern.fullmatch(message.record["message"])
-    if match and match[1] in STAGES:
-        values, lock = target
-        with lock:
-            values[match[1]] = values.get(match[1], 0) + float(match[2])
-
-
-@contextmanager
-def record_sdk_stages(timings):
-    global _installed
-    from loguru import logger
-
-    with _sink_lock:
-        if not _installed:
-            logger.add(_sink, filter=lambda record: record["name"] == "mineru.utils.timing")
-            _installed = True
-    token = _current.set((timings, threading.Lock()))
-    try:
-        yield
-    finally:
-        _current.reset(token)
-
-
-@contextmanager
-def timed(timings, stage):
-    started = perf_counter()
-    try:
-        yield
-    finally:
-        timings[stage] = timings.get(stage, 0) + perf_counter() - started
+    # Recent throughput uses retained completion timestamps. Keep the denominator
+    # within retention so shortening retention cannot silently truncate this window.
+    window = min(300, store.config.retention_seconds)
+    with store.connect() as connection:
+        recent_pages = connection.execute(
+            "SELECT coalesce(sum(pages),0) FROM jobs WHERE state='succeeded' AND finished>=?",
+            (store.clock() - window,),
+        ).fetchone()[0]
+    pages, seconds = totals["measured_pages"], totals["parse_seconds"]
+    return {
+        "queue": {
+            "queued": states["queued"],
+            "running": states["running"],
+            "pending": states["queued"] + states["running"],
+            "max_pending": store.settings.max_pending,
+            "pending_pages": states["pending_pages"],
+            "oldest_wait_seconds": states["oldest_wait_seconds"],
+        },
+        "parsing": {
+            **totals,
+            "average_seconds_per_page": seconds / pages if pages else None,
+            "average_pages_per_second": pages / seconds if seconds else None,
+            "recent_window_seconds": window,
+            "recent_completed_pages": recent_pages,
+            "recent_pages_per_minute": recent_pages * 60 / window,
+        },
+        "workers": states["workers"],
+    }
 
 
 class QueueCollector:
@@ -96,7 +60,7 @@ class QueueCollector:
         self.store = store
 
     def collect(self):
-        from app.infrastructure.sqlite.jobs import BUCKETS
+        from app.queue.store import BUCKETS
 
         rows, counters = self.store.metric_rows()
         durations = HistogramMetricFamily(

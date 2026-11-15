@@ -22,8 +22,6 @@ ENV MINERU_MODEL_SMALL_BACKEND=${SMALL_BACKEND} \
     MINERU_MODEL_SOURCE=modelscope \
     PARSE_TIER=standard \
     PYTHONUNBUFFERED=1
-EXPOSE 3000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s \
-  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/health', timeout=3)"
-ENTRYPOINT ["python3", "-m", "uvicorn"]
-CMD ["app.main:app", "--host", "0.0.0.0", "--port", "3000", "--workers", "1"]
+HEALTHCHECK NONE
+ENTRYPOINT ["python3", "-m", "app.worker"]
+CMD []

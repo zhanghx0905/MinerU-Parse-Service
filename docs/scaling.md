@@ -12,7 +12,7 @@
 
 所有模式另有 1 个 CPU API 和 1 个 VLM 网关。每个 worker 容器启动一个轻量监督进程，再用 `spawn` 启动解析子进程；每个子进程同时处理一份 PDF，独立持有本地模型和 SDK 锁。vLLM 服务按 GPU 运行，由这些解析进程共享。
 
-SQLite 和对象存储只由 API 访问。数据库必须放在协调主机本地持久磁盘，不支持多主机通过 NFS 打开同一 WAL 文件。解析 worker 可以跨主机扩容；当前没有控制平面自动故障转移或自动扩缩容。
+SQLite 和本地对象目录只由唯一的 API 进程访问。启动第二个 API 打开同一数据库会被进程锁拒绝；Compose 固定 `--workers 1`。数据库必须放在协调主机本地持久磁盘，不支持多主机通过 NFS 打开同一 WAL 文件。解析 worker 可以跨主机扩容；当前没有控制平面自动故障转移或自动扩缩容。
 
 ## 初始化与启动
 
@@ -64,14 +64,14 @@ docker compose -f compose.yaml -f compose.scale.yaml -f compose.quad.yaml ps
 
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
-| `API_PORT` / `API_PROCESSES` | 3888 / 1 | 对外端口与 API 进程数 |
+| `API_PORT` | 3888 | 对外端口；API 固定一个进程 |
 | `PDF_API_KEY` | 空 | 业务接口的可选 Bearer 密钥 |
 | `WORKER_API_TOKEN` | 初始化脚本生成 | 内部 worker 接口凭据，队列模式必填 |
 | `MAX_PENDING` | 10000 | 全局 queued + running 总量 |
 | `QUEUE_MAX_UPLOADS` | 64 | 上传、校验、输入存储中的并发请求 |
 | `QUEUE_MAX_SYNC_WAITERS` | 64 | 同步 HTTP 在途请求 |
 | `QUEUE_MAX_TRANSFERS` | 64 | 结果下载及 worker 文件传输并发 |
-| `MAX_UPLOAD_BYTES` / `MAX_PAGES` | 52428800 / 1000 | 单份 PDF 大小、页数上限，超限返回 413 |
+| `MAX_UPLOAD_BYTES` / `MAX_PAGES` | 209715200 / 2000 | 单份 PDF 大小、页数上限，超限返回 413 |
 | `REQUEST_TIMEOUT` | 540 | 同步请求总等待预算，不取消持久任务 |
 | `QUEUE_UPLOAD_SECONDS` / `QUEUE_TRANSFER_SECONDS` | 120 / 120 | 接收请求体与文件传输期限 |
 | `QUEUE_MAX_QUEUE_SECONDS` | 0 | 0 表示排队不过期；正数才启用队列超时 |
@@ -81,17 +81,16 @@ docker compose -f compose.yaml -f compose.scale.yaml -f compose.quad.yaml ps
 | `QUEUE_POLL_SECONDS` | 0.25 | 空闲领取与结果轮询间隔 |
 | `QUEUE_RETENTION_SECONDS` | 86400 | 终态任务、成功结果及失败输入保留期 |
 | `QUEUE_MAX_RESULT_BYTES` | 67108864 | 单份 Markdown 结果上限 |
-| `CACHE_BYTES` / `CACHE_TTL` | 134217728 / 3600 | 可复用结果的字节预算与有效期 |
 
-上传名额在输入持久化后释放，与队列积压量分开计数。降低容量不删除已有任务，只暂停超过上限时的新建任务。多个 API 进程使用同一份配置并一起重启。
+上传名额在输入持久化后释放，与队列积压量分开计数。降低容量不删除已有任务，只暂停超过上限时的新建任务。请求名额在 API 内存中计数，连接结束或进程退出后释放；任务容量仍由 SQLite 原子检查。成功结果在保留期内可复用，不设独立的缓存字节预算或 TTL。
 
 ### 文件存储与远端 worker
 
 Compose 的 `QUEUE_DATABASE` 为 `/data/queue.sqlite3`，`OBJECT_DIR` 为 `/data/objects`，使用 `queue-data` 持久卷。直接运行 Python 时默认分别为 `data/queue.sqlite3`、`data/objects`。
 
-`OBJECT_STORAGE=local` 使用本地目录；设置为 `s3` 时配置 `S3_BUCKET`、可选 `S3_ENDPOINT_URL` 和标准 AWS 凭据。只有 API 访问对象存储，worker 始终经认证 HTTP 下载输入和提交结果。
+本地文件采用同目录临时文件、同步落盘和原子替换。只有 API 访问对象目录；远端 worker 经认证 HTTP 下载输入和提交结果。
 
-`MODEL_DIR` 未设置时使用 Compose 的 `models` 命名卷；也可指定模型所在的宿主机目录。远端 worker 需要 `WORKER_API_URL`、`WORKER_API_TOKEN`、模型目录、GPU 和 VLM 服务地址，并保持 MinerU 版本与 `MODEL_REVISION` 一致。直接运行的入口是 `python -m app.interfaces.worker`。
+`MODEL_DIR` 未设置时使用 Compose 的 `models` 命名卷；也可指定模型所在的宿主机目录。远端 worker 需要 `WORKER_API_URL`、`WORKER_API_TOKEN`、模型目录、GPU 和 VLM 服务地址，并保持 MinerU 版本与 `MODEL_REVISION` 一致。直接运行的入口是 `python -m app.worker`。
 
 ## 更新与停止
 
@@ -102,10 +101,10 @@ Compose 的 `QUEUE_DATABASE` 为 `/data/queue.sqlite3`，`OBJECT_DIR` 为 `/data
 ### 旧版本升级
 
 1. 暂停提交、排空任务，备份数据库与对象文件，停止旧 API 和全部 worker。
-2. 构建并启动同版本 API / worker。schema 1/2 自动事务迁移至 3，任务、结果、租约和幂等映射保留；旧任务默认普通优先级。
-3. 迁移删除旧 `limits` 表和成本、短文档调度字段。schema 1 保留原解析选项并清除旧内容复用标记，schema 2 保留已有选项与缓存资格。
-4. 更新旧 `.env` 的容量和超时值，删除 `QUEUE_MAX_WORK`；旧值不会自动覆盖。worker 协议为 3，旧 worker 会被拒绝。
-5. 预热后用实际 PDF 验证接口，再恢复流量。迁移后回退需恢复升级前备份。
+2. 构建并启动同版本 API / worker。schema 1/2/3 自动事务迁移至 4，保留任务、结果、租约、上传恢复记录、垃圾清单和累计统计；schema 1 保留原解析选项并取消旧结果的复用资格。
+3. 迁移删除客户端幂等表、HTTP 等待/传输名额表、旧容量表，以及不再消费的任务指纹副本、开始时间、原始阶段计时和缓存预算字段。汇总阶段直方图与成功速度统计保留。迁移失败回滚，未知 schema 拒绝启动。
+4. 删除旧 `.env` 中的 `SERVICE_MODE`、`API_PROCESSES`、`CACHE_BYTES`、`CACHE_TTL`、`OBJECT_STORAGE`、S3/AWS 配置和旧 `QUEUE_MAX_WORK`。当前只支持本地存储、单 API；worker 入口改为 `python -m app.worker`，协议仍为 3。
+5. 预热后用实际 PDF 验证接口，再恢复流量。结果复用期统一为 `QUEUE_RETENTION_SECONDS`，默认一天；需要重算时使用 `disable_cache=true`。迁移后回退需停止新服务并恢复升级前备份。
 
 模型或解析器升级时同步更新权重、API、worker 和 `MODEL_REVISION`，先排空旧任务。服务校验版本标识，不自动为旧任务挑选旧模型。
 
@@ -114,8 +113,8 @@ Compose 的 `QUEUE_DATABASE` 为 `/data/queue.sqlite3`，`OBJECT_DIR` 为 `/data
 在线数据库备份：
 
 ```bash
-docker compose exec mineru-api python -m app.cli.queue \
-  --database /data/queue.sqlite3 backup /data/backup.sqlite3
+docker compose exec mineru-api python -m app.queue.database \
+  --database /data/queue.sqlite3 /data/backup.sqlite3
 ```
 
 四卡部署使用相同三份 Compose 文件执行该命令。备份命令只包含 SQLite，不包含 PDF、Markdown、模型或凭据；不要单独复制正在变化的数据库主文件。
@@ -124,9 +123,9 @@ docker compose exec mineru-api python -m app.cli.queue \
 
 ```bash
 docker compose run --rm --no-deps --entrypoint python mineru-api \
-  -m app.cli.queue --database /data/queue.sqlite3 backup /data/backup.sqlite3
+  -m app.queue.database --database /data/queue.sqlite3 /data/backup.sqlite3
 ```
 
 对象备份期间保持 API 停止，避免后台清理改变文件集合。恢复时将数据库与对应对象一起恢复，使用匹配的模型和配置启动。`docker compose down` 保留命名卷，`down -v` 删除数据；主机或磁盘损坏的自动恢复尚未实现。
 
-后台按保留期清理任务和文件，删除失败保留垃圾记录重试。缓存预算只限制复用资格，不限制全部保留结果或总磁盘用量；仍需监控容量。业务失败由调用方处理，当前没有原 ID 手动重排接口。故障码与文件清理边界见[调度说明](scheduling.md)。
+后台按保留期清理任务和文件，删除失败保留垃圾记录重试。任务与文件按保留期清理，未设置总存储字节配额；仍需监控磁盘容量。业务失败由调用方处理，当前没有原 ID 手动重排接口。故障码与文件清理边界见[调度说明](scheduling.md)。

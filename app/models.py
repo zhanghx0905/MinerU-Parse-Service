@@ -55,3 +55,52 @@ class InvalidDocument(Exception):
 
 class DocumentLimitExceeded(InvalidDocument):
     pass
+
+
+class ServiceBusy(Exception):
+    pass
+
+
+class LeaseLost(Exception):
+    pass
+
+
+WORKER_PROTOCOL_VERSION = 3
+
+STAGES = frozenset(
+    {
+        "api.upload",
+        "api.validate",
+        "storage.input",
+        "storage.result",
+        "queue.wait",
+        "sdk.total",
+        "markdown.render",
+        "job.total",
+        "worker.download",
+        "worker.parse",
+        "model.initialize",
+        "vlm.http",
+        "vlm.queue",
+        *(
+            "pdf." + name
+            for name in (
+                "prepare",
+                "cleanup",
+                "geometry",
+                "ocr_detection",
+                "ocr_recognition",
+                "text_fill",
+                "formulas",
+                "table_recognition",
+                "formula_numbers",
+                "render",
+                "layout",
+                "table_orientation",
+                "native_tables",
+                "seals",
+                "image_assets",
+            )
+        ),
+    }
+)

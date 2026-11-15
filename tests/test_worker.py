@@ -7,11 +7,11 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.config import QueueSettings, Settings
-from app.domain.parsing import ParseOutput
-from app.interfaces.gateway import create_gateway
-from app.interfaces.worker import Worker
+from app.gateway import create_gateway
 from app.main import create_app
-from tests.test_queue import pdf
+from app.models import ParseOutput
+from app.worker import Worker
+from tests.helpers import make_pdf as pdf
 
 
 class StubEngine:
@@ -23,7 +23,7 @@ class StubEngine:
 
 
 def test_worker_executes_through_real_http_protocol(tmp_path):
-    settings = Settings(service_mode="queue", preload_models=False)
+    settings = Settings(preload_models=False)
     config = QueueSettings(
         database=str(tmp_path / "queue.db"),
         object_dir=str(tmp_path / "objects"),
@@ -37,7 +37,7 @@ def test_worker_executes_through_real_http_protocol(tmp_path):
         worker = Worker(
             settings,
             config,
-            engine=StubEngine(),
+            parse=StubEngine().parse,
             client=client,
             fatal_exit=lambda code: (_ for _ in ()).throw(AssertionError(code)),
         )
@@ -53,7 +53,7 @@ def test_invalid_measurements_and_wrong_version_are_rejected(tmp_path):
     config = QueueSettings(
         database=str(tmp_path / "q.db"), object_dir=str(tmp_path / "o"), worker_token="test-worker"
     )
-    with TestClient(create_app(Settings(service_mode="queue"), queue_settings=config)) as client:
+    with TestClient(create_app(Settings(), queue_settings=config)) as client:
         client.headers["Authorization"] = "Bearer " + config.worker_token
         assert (
             client.post(
@@ -145,7 +145,7 @@ def test_sdk_stage_capture_uses_installed_sdk_timer(monkeypatch):
 
     from mineru.utils.timing import stage_timer
 
-    from app.infrastructure.metrics import record_sdk_stages
+    from app.parser.timing import record_sdk_stages
 
     monkeypatch.setenv("MINERU_PROFILE_STAGES", "true")
     timings = {}
@@ -183,7 +183,7 @@ def test_worker_stops_stale_gpu_execution():
 
     config = QueueSettings(worker_token="test-worker", lease_seconds=0.5, heartbeat_seconds=0.02)
     worker = Worker(
-        Settings(), config, engine=BlockingEngine(), client=LostClient(), fatal_exit=terminate
+        Settings(), config, parse=BlockingEngine().parse, client=LostClient(), fatal_exit=terminate
     )
     worker.execute(
         {

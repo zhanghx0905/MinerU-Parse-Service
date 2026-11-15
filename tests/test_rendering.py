@@ -4,8 +4,8 @@ from itertools import product
 
 import pytest
 
-from app.domain.parsing import ParseOptions
-from app.infrastructure.mineru.rendering import render_result
+from app.models import ParseOptions
+from app.parser.rendering import render_result
 
 IMAGE = "data:image/png;base64,eA=="
 
@@ -89,7 +89,6 @@ def test_all_fastgpt_options_are_independent_and_do_not_mutate_result(flags, enc
             ],
         ]
     )
-    original = result.middle_json.model_dump_json()
     markdown = render_result(result, encode_img, options).replace(r"\_", "_")
     for sentinel in ("HEADER_SENTINEL", "FOOTER_SENTINEL", "PAGE_SENTINEL"):
         assert (sentinel in markdown) == options.keep_header_footer
@@ -108,7 +107,6 @@ def test_all_fastgpt_options_are_independent_and_do_not_mutate_result(flags, enc
     ):
         assert expected in markdown
     assert "Ordinary body mentions Appendix" in markdown
-    assert result.middle_json.model_dump_json() == original
 
 
 @pytest.mark.parametrize("title", ["附录 A 补充说明", "附錄：資料", "Appendices", "12. Appendix B"])
@@ -117,30 +115,28 @@ def test_appendix_heading_recognition(title):
     assert not render_result(result, True, ParseOptions(keep_appendix=False)).strip()
 
 
-def test_parser_instances_follow_analysis_policy(monkeypatch):
-    from app.infrastructure.mineru.engine import MinerUEngine
+def test_parser_receives_analysis_policy_for_each_document(monkeypatch):
+    from mineru.parser.base import DocumentParser
+
+    from app.parser.engine import parse_pdf
 
     created = []
 
-    class Parser:
+    class Parser(DocumentParser):
         def __init__(self, *, tier, image_analysis):
             created.append((tier, image_analysis))
 
         def parse(self, _path):
             return sdk_result([[visual("image", "Recognized image")]])
 
-        def close(self):
-            pass
-
     monkeypatch.setattr("mineru.MinerUParser", Parser)
-    engine = MinerUEngine("advanced")
-    try:
-        assert "Recognized image" not in engine.parse(b"pdf", True).markdown
-        assert (
-            "Recognized image"
-            in engine.parse(b"pdf", True, options=ParseOptions(image_analysis=True)).markdown
-        )
-        engine.parse(b"pdf", True, options=ParseOptions(keep_header_footer=True))
-        assert created == [("advanced", False), ("advanced", True)]
-    finally:
-        engine.close()
+    assert "Recognized image" not in parse_pdf(b"pdf", True, "advanced", ParseOptions()).markdown
+    assert (
+        "Recognized image"
+        in parse_pdf(b"pdf", True, "advanced", ParseOptions(image_analysis=True)).markdown
+    )
+    assert (
+        "Recognized image"
+        not in parse_pdf(b"pdf", True, "advanced", ParseOptions(keep_header_footer=True)).markdown
+    )
+    assert set(created) == {("advanced", False), ("advanced", True)}

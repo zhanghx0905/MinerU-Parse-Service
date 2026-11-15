@@ -8,11 +8,10 @@ from fastapi.testclient import TestClient
 from prometheus_client.parser import text_string_to_metric_families
 
 from app.config import QueueSettings, Settings
-from app.infrastructure.metrics import render_metrics
-from app.infrastructure.sqlite.jobs import QueueStore
-from app.infrastructure.sqlite.observability import read_observability
 from app.main import create_app
-from tests.test_api import make_pdf
+from app.queue.metrics import read_observability, render_metrics
+from app.queue.store import QueueStore
+from tests.helpers import make_pdf
 
 
 def submit(store, pages, fingerprint=None):
@@ -28,7 +27,7 @@ def submit(store, pages, fingerprint=None):
 @pytest.fixture
 def store(tmp_path):
     now = [1000.0]
-    settings = Settings(service_mode="queue", preload_models=False)
+    settings = Settings(preload_models=False)
     config = QueueSettings(database=str(tmp_path / "queue.db"))
     return QueueStore(settings, config, clock=lambda: now[0]), now
 
@@ -106,7 +105,7 @@ def test_recent_throughput_uses_retained_wall_clock_window(store):
 
 
 def test_stats_and_prometheus_expose_the_same_persisted_observations(tmp_path):
-    settings = Settings(service_mode="queue", preload_models=False, api_key="observer-key")
+    settings = Settings(preload_models=False, api_key="observer-key")
     config = QueueSettings(
         database=str(tmp_path / "queue.db"),
         object_dir=str(tmp_path / "objects"),

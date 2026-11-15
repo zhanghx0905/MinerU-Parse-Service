@@ -5,16 +5,30 @@ import math
 import time
 from uuid import uuid4
 
-from app.domain.jobs import (
-    IdempotencyConflict,
+from app.models import (
     LeaseLost,
+    ParseOptions,
     ServiceBusy,
 )
-from app.domain.parsing import ParseOptions
-from app.infrastructure.sqlite.database import QueueDatabase
-from app.infrastructure.sqlite.observability import record_completion
+from app.queue.database import QueueDatabase
 
 BUCKETS = (0.01, 0.1, 0.5, 1, 5, 20, 60, 300, math.inf)
+
+
+def record_completion(connection, tier, pages, timings):
+    """Count a published execution once; pair measured pages with their own execution time."""
+    seconds = timings.get("worker.parse")
+    measured = seconds is not None and math.isfinite(seconds) and seconds > 0
+    connection.execute(
+        "INSERT INTO processing_totals VALUES (?,?,?,?,?,?) "
+        "ON CONFLICT(tier) DO UPDATE SET "
+        "completed_jobs=completed_jobs+excluded.completed_jobs,"
+        "completed_pages=completed_pages+excluded.completed_pages,"
+        "measured_jobs=measured_jobs+excluded.measured_jobs,"
+        "measured_pages=measured_pages+excluded.measured_pages,"
+        "parse_seconds=parse_seconds+excluded.parse_seconds",
+        (tier, 1, pages, int(measured), pages if measured else 0, seconds if measured else 0),
+    )
 
 
 class QueueStore(QueueDatabase):
@@ -48,11 +62,10 @@ class QueueStore(QueueDatabase):
                 count + int(value <= bound) for count, bound in zip(counts, BUCKETS, strict=True)
             ]
             connection.execute(
-                "INSERT OR REPLACE INTO metrics VALUES (?,?,?,?,?)",
+                "INSERT OR REPLACE INTO metrics VALUES (?,?,?,?)",
                 (
                     stage,
                     tier,
-                    (old["count"] if old else 0) + 1,
                     (old["total"] if old else 0) + value,
                     json.dumps(counts),
                 ),
@@ -80,8 +93,6 @@ class QueueStore(QueueDatabase):
             if not connection.execute("SELECT 1 FROM jobs WHERE input_key=?", (key,)).fetchone():
                 self._garbage(connection, key)
         connection.execute("DELETE FROM uploads WHERE expires<=?", (now,))
-        connection.execute("DELETE FROM waiters WHERE expires<=?", (now,))
-        connection.execute("DELETE FROM transfers WHERE expires<=?", (now,))
         for job in connection.execute(
             "SELECT * FROM jobs WHERE state='running' AND lease_until<=?", (now,)
         ).fetchall():
@@ -92,18 +103,12 @@ class QueueStore(QueueDatabase):
                 (now - self.config.max_queue_seconds,),
             ).fetchall():
                 self._terminal(connection, job, "queue_timeout", now)
-        connection.execute(
-            "UPDATE jobs SET dedup_key=NULL WHERE state='succeeded' "
-            "AND dedup_key IS NOT NULL AND cache_until<=?",
-            (now,),
-        )
         for job in connection.execute(
             "SELECT * FROM jobs WHERE state IN ('succeeded','failed') AND finished<?",
             (now - self.config.retention_seconds,),
         ).fetchall():
             self._garbage(connection, job["input_key"])
             self._garbage(connection, job["output_key"])
-            connection.execute("DELETE FROM idempotency WHERE job_id=?", (job["id"],))
             connection.execute("DELETE FROM jobs WHERE id=?", (job["id"],))
         connection.execute(
             "DELETE FROM workers WHERE seen<?", (now - self.config.lease_seconds * 2,)
@@ -113,47 +118,14 @@ class QueueStore(QueueDatabase):
         with self.transaction() as connection:
             self._sweep(connection, self.clock())
 
-    def reserve_upload(self, wait_for_result=False):
-        now = self.clock()
+    def reserve_upload(self):
+        token = uuid4().hex
         with self.transaction() as connection:
-            self._sweep(connection, now)
-            count = connection.execute("SELECT count(*) FROM uploads").fetchone()[0]
-            if count >= self.config.max_uploads:
-                raise ServiceBusy("Upload capacity is full; retry later")
-            if wait_for_result:
-                waiting = connection.execute("SELECT count(*) FROM waiters").fetchone()[0]
-                if waiting >= self.config.max_sync_waiters:
-                    raise ServiceBusy("Synchronous wait capacity is full")
-            token = uuid4().hex
-            if wait_for_result:
-                connection.execute(
-                    "INSERT INTO waiters VALUES (?,?)",
-                    (token, now + self.config.upload_seconds + self.settings.request_timeout + 15),
-                )
             connection.execute(
-                "INSERT INTO uploads VALUES (?,?)", (token, now + self.config.upload_seconds + 10)
+                "INSERT INTO uploads VALUES (?,?)",
+                (token, self.clock() + self.config.upload_seconds + 10),
             )
-            return token
-
-    def reserve_transfer(self):
-        with self.transaction() as connection:
-            now = self.clock()
-            connection.execute("DELETE FROM transfers WHERE expires<=?", (now,))
-            if (
-                connection.execute("SELECT count(*) FROM transfers").fetchone()[0]
-                >= self.config.max_transfers
-            ):
-                raise ServiceBusy("Transfer capacity is full")
-            token = uuid4().hex
-            connection.execute(
-                "INSERT INTO transfers VALUES (?,?)",
-                (token, now + self.config.transfer_seconds + 10),
-            )
-            return token
-
-    def release_transfer(self, token):
-        with self.transaction() as connection:
-            connection.execute("DELETE FROM transfers WHERE id=?", (token,))
+        return token
 
     def renew_upload(self, token):
         with self.transaction() as connection:
@@ -165,10 +137,6 @@ class QueueStore(QueueDatabase):
                 ).rowcount
                 == 1
             )
-
-    def release_waiter(self, token):
-        with self.transaction() as connection:
-            connection.execute("DELETE FROM waiters WHERE id=?", (token,))
 
     def release_upload(self, token):
         with self.transaction() as connection:
@@ -186,7 +154,6 @@ class QueueStore(QueueDatabase):
         tier,
         encode_img,
         disable_cache=False,
-        idempotency_key=None,
         upload_token=None,
         options=None,
         priority=0,
@@ -204,27 +171,11 @@ class QueueStore(QueueDatabase):
                 ).fetchone()
             ):
                 raise ServiceBusy("Upload reservation expired")
-            if idempotency_key:
-                existing = connection.execute(
-                    "SELECT jobs.* FROM idempotency JOIN jobs ON jobs.id=idempotency.job_id "
-                    "WHERE idempotency.key=?",
-                    (idempotency_key,),
-                ).fetchone()
-                if existing:
-                    if existing["fingerprint"] != fingerprint:
-                        raise IdempotencyConflict("Idempotency key was used for different input")
-                    self._counter(connection, "idempotency_hit")
-                    return self._promote(connection, existing, priority), True
             if not disable_cache:
                 existing = connection.execute(
                     "SELECT * FROM jobs WHERE dedup_key=?", (fingerprint,)
                 ).fetchone()
                 if existing:
-                    if idempotency_key:
-                        connection.execute(
-                            "INSERT INTO idempotency VALUES (?,?,?)",
-                            (idempotency_key, fingerprint, existing["id"]),
-                        )
                     self._counter(
                         connection, "cache_hit" if existing["state"] == "succeeded" else "coalesced"
                     )
@@ -235,17 +186,14 @@ class QueueStore(QueueDatabase):
             if count >= self.settings.max_pending:
                 raise ServiceBusy("Parse queue is full; retry later")
             job_id = uuid4().hex
-            # Explicit independent keys may intentionally represent distinct jobs.
             dedup = fingerprint if not disable_cache else None
             connection.execute(
-                "INSERT INTO jobs (id,fingerprint,dedup_key,idempotency_key,input_key,"
+                "INSERT INTO jobs (id,dedup_key,input_key,"
                 "tier,encode_img,pages,priority,state,created,queued,available,parse_options) "
-                "VALUES (?,?,?,?,?,?,?,?,?,'queued',?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,'queued',?,?,?,?)",
                 (
                     job_id,
-                    fingerprint,
                     dedup,
-                    None,
                     input_key,
                     tier,
                     int(encode_img),
@@ -257,10 +205,6 @@ class QueueStore(QueueDatabase):
                     options.to_json(),
                 ),
             )
-            if idempotency_key:
-                connection.execute(
-                    "INSERT INTO idempotency VALUES (?,?,?)", (idempotency_key, fingerprint, job_id)
-                )
             self._counter(connection, "submitted")
             return dict(
                 connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -301,8 +245,8 @@ class QueueStore(QueueDatabase):
             token = uuid4().hex
             connection.execute(
                 "UPDATE jobs SET state='running',attempts=attempts+1,lease_token=?,"
-                "lease_until=?,started=?,worker_id=? WHERE id=?",
-                (token, now + self.config.lease_seconds, now, worker_id, job["id"]),
+                "lease_until=?,worker_id=? WHERE id=?",
+                (token, now + self.config.lease_seconds, worker_id, job["id"]),
             )
             self._observe(connection, job["tier"], {"queue.wait": now - job["queued"]})
             return dict(
@@ -338,7 +282,7 @@ class QueueStore(QueueDatabase):
                 )
             return job
 
-    def complete(self, job_id, token, pages, timings, result_bytes=0):
+    def complete(self, job_id, token, pages, timings):
         key = f"results/{token}.md"
         with self.transaction() as connection:
             try:
@@ -354,32 +298,10 @@ class QueueStore(QueueDatabase):
                 return False
             now = self.clock()
             connection.execute(
-                "UPDATE jobs SET state='succeeded',output_key=?,finished=?,cache_until=?,"
-                "completed_token=?,lease_token=NULL,lease_until=NULL,error=NULL,timings=?,"
-                "result_bytes=? WHERE id=?",
-                (
-                    key,
-                    now,
-                    now + self.settings.cache_ttl,
-                    token,
-                    json.dumps(timings),
-                    result_bytes,
-                    job_id,
-                ),
+                "UPDATE jobs SET state='succeeded',output_key=?,finished=?,"
+                "completed_token=?,lease_token=NULL,lease_until=NULL,error=NULL WHERE id=?",
+                (key, now, token, job_id),
             )
-            cached = connection.execute(
-                "SELECT id,result_bytes FROM jobs WHERE dedup_key IS NOT NULL "
-                "AND state='succeeded' ORDER BY finished DESC"
-            ).fetchall()
-            cache_size = 0
-            for row in cached:
-                if (
-                    not self.settings.cache_bytes
-                    or cache_size + row["result_bytes"] > self.settings.cache_bytes
-                ):
-                    connection.execute("UPDATE jobs SET dedup_key=NULL WHERE id=?", (row["id"],))
-                else:
-                    cache_size += row["result_bytes"]
             self._observe(connection, job["tier"], timings)
             self._observe(connection, job["tier"], {"job.total": now - job["created"]})
             self._counter(connection, "succeeded")

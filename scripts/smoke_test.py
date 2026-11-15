@@ -3,6 +3,7 @@
 import argparse
 import io
 import json
+import os
 import time
 
 import httpx
@@ -53,7 +54,12 @@ def main():
     args = parser.parse_args()
     payload = sample_pdf()
     with httpx.Client(
-        base_url=args.url.rstrip("/"), timeout=args.timeout, trust_env=False
+        base_url=args.url.rstrip("/"),
+        timeout=args.timeout,
+        trust_env=False,
+        headers={"Authorization": "Bearer " + os.environ["PDF_API_KEY"]}
+        if os.getenv("PDF_API_KEY")
+        else {},
     ) as client:
         health = client.get("/health")
         health.raise_for_status()

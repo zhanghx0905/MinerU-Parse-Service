@@ -1,8 +1,8 @@
 # MinerU PDF API
 
-基于 MinerU 4.0.12 的 PDF 转 Markdown 服务，当前版本 **1.3.1**。接收 PDF，异步解析并提供结果查询，也支持 FastGPT 同步接口；切块、向量化和 RAG 入库由调用方负责。
+基于 MinerU 4.0.12 的 PDF 转 Markdown 服务，当前版本 **1.4.0**。接收 PDF，异步解析并提供结果查询，也支持 FastGPT 同步接口；切块、向量化和 RAG 入库由调用方负责。
 
-CPU API 使用本地 SQLite WAL 保存任务。GPU worker 容器通过 HTTP 领取任务，每个解析子进程独立加载本地模型，共享外部 vLLM 推理服务。配置统一来自环境变量，Compose 从 `.env` 注入，数据库不保存容量配置。
+单进程 CPU API 使用本地 SQLite WAL 保存任务，PDF 和 Markdown 保存在本地持久卷。GPU worker 容器通过 HTTP 领取任务，每个解析子进程独立加载本地模型，共享外部 vLLM 推理服务。配置统一来自环境变量，Compose 从 `.env` 注入，数据库不保存容量配置。
 
 ## 快速启动
 
@@ -36,7 +36,7 @@ worker 容器数与解析进程数是两个维度。四卡配置共 10 个容器
 推荐使用异步接口接收批量任务：
 
 ```bash
-curl -F 'file=@example.pdf' -H 'Idempotency-Key: example-request-1' \
+curl -F 'file=@example.pdf' \
   'http://127.0.0.1:3888/jobs?tier=standard&priority=0'
 # HTTP 202 返回 id、status_url、result_url。
 curl http://127.0.0.1:3888/jobs/REPLACE_WITH_JOB_ID
@@ -52,17 +52,16 @@ curl --max-time 600 -F 'file=@example.pdf' \
 
 `priority=1` 为高优任务，默认 `0`。同级按入队顺序处理；高优专用进程无高优任务时保持空闲。同步请求超时不会取消已经入队的任务。支持 `flash / basic / standard / advanced` 四个档位，完整参数、响应和错误规则见[HTTP 与 FastGPT 接口](docs/fastgpt.md)。
 
-默认允许 10000 个在途任务、64 个并发上传，排队不过期。单文件默认上限为 50 MiB、1000 页，超限返回 413。API 上传和 worker 渲染的临时文件使用容器磁盘及 Linux 页缓存，不挂载固定容量的 `/tmp` 内存盘。
+默认允许 10000 个在途任务、64 个并发上传，排队不过期。相同内容在结果保留期内复用，默认一天；`disable_cache=true` 始终提交新任务。单文件默认上限为 200 MiB、2000 页，超限返回 413。API 上传和 worker 渲染的临时文件使用容器磁盘及 Linux 页缓存，不挂载固定容量的 `/tmp` 内存盘。
 
 ## 文档与开发
 
-[文档索引](docs/README.md)按职责组织说明：
+文档按职责组织说明：
 
-- [架构与代码入口](docs/architecture.md)
+- [代码结构、开发和验证](docs/development.md)
 - [部署、配置、升级和备份](docs/scaling.md)
 - [调度、租约与故障处理](docs/scheduling.md)
 - [指标口径](docs/observability.md)和[监控部署](monitoring/README.md)
-- [验证与本地开发](docs/validation.md)
 - [性能观察与复现](docs/benchmark.md)
 
 源码在 `app/`，回归测试在 `tests/`，可复用工具在 `scripts/`。生成文件统一放在忽略版本控制的 `artifacts/`，模型、业务文件、数据库、密钥和离线镜像不提交到仓库。

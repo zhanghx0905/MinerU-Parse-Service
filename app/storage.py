@@ -5,8 +5,6 @@ import re
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from app.config import QueueSettings
-
 _KEY = re.compile(r"(?:inputs|results)/[a-f0-9]{32}\.(?:pdf|md)\Z")
 
 
@@ -48,40 +46,3 @@ class LocalStorage:
     def delete(self, key):
         validate_key(key)
         (self.root / key).unlink(missing_ok=True)
-
-
-class S3Storage:
-    def __init__(self, bucket, endpoint=None):
-        import boto3
-        from botocore.config import Config
-
-        self.client = boto3.client(
-            "s3",
-            endpoint_url=endpoint,
-            config=Config(
-                connect_timeout=5, read_timeout=30, retries={"max_attempts": 2, "mode": "standard"}
-            ),
-        )
-        self.bucket = bucket
-
-    def put(self, key, data):
-        validate_key(key)
-        self.client.put_object(Bucket=self.bucket, Key=key, Body=data)
-
-    def get(self, key):
-        validate_key(key)
-        response = self.client.get_object(Bucket=self.bucket, Key=key)
-        try:
-            return response["Body"].read()
-        finally:
-            response["Body"].close()
-
-    def delete(self, key):
-        validate_key(key)
-        self.client.delete_object(Bucket=self.bucket, Key=key)
-
-
-def create_storage(settings: QueueSettings):
-    if settings.storage == "s3":
-        return S3Storage(settings.s3_bucket, settings.s3_endpoint)
-    return LocalStorage(settings.object_dir)

@@ -9,31 +9,32 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import QueueSettings, Settings
-from app.domain.jobs import ServiceBusy
-from app.infrastructure.sqlite.jobs import QueueStore
-from app.infrastructure.sqlite.observability import read_observability
 from app.main import create_app
-from tests.test_queue import pdf, submit
+from app.models import ServiceBusy
+from app.queue.metrics import read_observability
+from app.queue.store import QueueStore
+from tests.helpers import make_pdf as pdf
+from tests.helpers import submit
 
 
 @pytest.fixture
 def store(tmp_path):
     return QueueStore(
-        Settings(service_mode="queue", preload_models=False),
+        Settings(preload_models=False),
         QueueSettings(database=str(tmp_path / "queue.db")),
     )
 
 
-def test_default_upload_capacity_accepts_64_concurrent_reservations(store):
+def test_upload_recovery_records_have_unique_tokens_and_survive_restart(store):
     with ThreadPoolExecutor(max_workers=16) as pool:
         tokens = list(pool.map(lambda _: store.reserve_upload(), range(64)))
     assert len(set(tokens)) == 64
-    with pytest.raises(ServiceBusy):
-        store.reserve_upload()
+    reopened = QueueStore(store.settings, store.config)
+    assert all(reopened.renew_upload(token) for token in tokens)
     for token in tokens:
-        store.release_upload(token)
-    token = store.reserve_upload()
-    store.release_upload(token)
+        reopened.release_upload(token)
+    with reopened.connect() as connection:
+        assert connection.execute("SELECT count(*) FROM uploads").fetchone()[0] == 0
 
 
 def test_env_is_the_only_source_of_capacity_after_restart(tmp_path, monkeypatch):
@@ -51,8 +52,6 @@ def test_env_is_the_only_source_of_capacity_after_restart(tmp_path, monkeypatch)
     assert all(lowered.get(job["id"])["state"] == "queued" for job in jobs)
     with pytest.raises(ServiceBusy):
         submit(lowered)
-    with pytest.raises(ServiceBusy):
-        lowered.reserve_upload()
     for token in tokens:
         lowered.release_upload(token)
     lowered.release_upload(lowered.reserve_upload())
@@ -104,15 +103,12 @@ def test_six_general_and_two_reserved_slots_leave_capacity_for_urgent_jobs(store
     assert store.stats()["queued"] == 2
 
 
-@pytest.mark.parametrize("explicit_key", [False, True])
-def test_urgent_reuse_promotes_existing_task_even_when_queue_is_full(store, explicit_key):
+def test_urgent_reuse_promotes_existing_task_even_when_queue_is_full(store):
     store.settings = replace(store.settings, max_pending=1)
-    kwargs = {"idempotency_key": "same-request", "disable_cache": True} if explicit_key else {}
-    first, _ = submit(store, "identical", **kwargs)
-    urgent, reused = submit(store, "identical", priority=1, **kwargs)
+    first, _ = submit(store, "identical")
+    urgent, reused = submit(store, "identical", priority=1)
     assert reused and urgent["id"] == first["id"] and urgent["priority"] == 1
-    normal, _ = submit(store, "identical", **kwargs)
-    assert normal["priority"] == 1
+    assert submit(store, "identical")[0]["priority"] == 1
     attempt = store.claim(uuid4().hex, 1)
     store.fail(attempt["id"], attempt["lease_token"])
     reopened = QueueStore(store.settings, store.config)
@@ -121,7 +117,7 @@ def test_urgent_reuse_promotes_existing_task_even_when_queue_is_full(store, expl
 
 
 def test_http_priority_and_reserved_claim_work_through_the_public_contract(tmp_path):
-    settings = Settings(service_mode="queue", preload_models=False)
+    settings = Settings(preload_models=False)
     config = QueueSettings(
         database=str(tmp_path / "queue.db"),
         object_dir=str(tmp_path / "objects"),

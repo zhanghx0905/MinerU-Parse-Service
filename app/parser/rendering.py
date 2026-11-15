@@ -1,8 +1,8 @@
-"""Apply FastGPT output policy to a copy of MinerU's structured document."""
+"""Consume one parsed document and apply the requested FastGPT output policy."""
 
 import re
 
-from app.domain.parsing import ParseOptions
+from app.models import ParseOptions
 
 _APPENDIX_TITLE = re.compile(
     r"^(?:(?:\d+(?:\.\d+)*|[IVX]+)[.、:：\s-]+)?(?:附\s*[录錄]|appendi(?:x|ces)\b)",
@@ -60,7 +60,7 @@ def render_result(result, encode_img: bool, options: ParseOptions) -> str:
     from mineru.render import render_markdown
     from mineru.types import BlockBase, ImagePayloadBlock, ImagePayloadContentBlock
 
-    document = result.middle_json.model_copy(deep=True)
+    document = result.middle_json
     _filter_sections(document, options)
     pending = [block for page in document.pages for block in page.blocks]
     while pending:

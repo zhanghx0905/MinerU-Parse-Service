@@ -12,10 +12,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import QueueSettings, Settings
-from app.domain.parsing import ParseOptions, ParseOutput
-from app.interfaces.worker import Worker
 from app.main import create_app
-from tests.test_api import make_pdf
+from app.models import ParseOptions, ParseOutput
+from app.worker import Worker
+from tests.helpers import make_pdf
 
 
 class OptionsEngine:
@@ -30,30 +30,9 @@ class OptionsEngine:
         pass
 
 
-@pytest.mark.parametrize("field", list(ParseOptions().to_dict()))
-def test_inline_cache_isolates_each_fastgpt_option(field):
-    engine = OptionsEngine()
-    with TestClient(create_app(Settings(preload_models=False), engine=engine)) as client:
-        upload = {"file": ("中文.PDF", make_pdf(), "application/pdf")}
-        default = client.post("/v2/parse/file", files=upload)
-        options = ParseOptions().to_dict()
-        options[field] = not options[field]
-        changed = client.post(
-            "/v2/parse/file", files=upload, data={k: str(v).lower() for k, v in options.items()}
-        )
-        assert default.status_code == changed.status_code == 200
-        assert json.loads(changed.json()["markdown"]) == options
-        assert len(engine.calls) == 2
-        assert (
-            client.post("/v2/parse/file", files=upload).json()["markdown"]
-            == default.json()["markdown"]
-        )
-        assert len(engine.calls) == 2
-
-
 @pytest.fixture
 def queue_app(tmp_path):
-    settings = Settings(service_mode="queue", preload_models=False, request_timeout=5)
+    settings = Settings(preload_models=False, request_timeout=5)
     config = QueueSettings(
         database=str(tmp_path / "jobs.db"),
         object_dir=str(tmp_path / "objects"),
@@ -76,7 +55,7 @@ def test_durable_options_survive_restart_and_reach_worker_and_cache(queue_app):
     with TestClient(create_app(settings, queue_settings=config)) as client:
         client.headers["Authorization"] = "Bearer " + config.worker_token
         engine = OptionsEngine()
-        worker = Worker(settings, config, engine=engine, client=client)
+        worker = Worker(settings, config, parse=engine.parse, client=client)
         worker.execute(worker.claim())
         result = client.get(first["result_url"])
         assert result.status_code == 200
@@ -94,7 +73,7 @@ def test_sync_fastgpt_request_executes_through_real_worker_protocol(queue_app):
         worker_client = TestClient(app)
         worker_client.headers["Authorization"] = "Bearer " + config.worker_token
         engine = OptionsEngine()
-        worker = Worker(settings, config, engine=engine, client=worker_client)
+        worker = Worker(settings, config, parse=engine.parse, client=worker_client)
         stop = threading.Event()
 
         def run_worker():
@@ -125,7 +104,7 @@ def test_sync_fastgpt_request_executes_through_real_worker_protocol(queue_app):
             worker_client.close()
 
 
-def test_sync_timeout_exposes_recoverable_job_and_supports_idempotency(queue_app, monkeypatch):
+def test_sync_timeout_exposes_recoverable_job_and_content_reuse(queue_app, monkeypatch):
     app, _, _ = queue_app
     with TestClient(app) as client:
 
@@ -134,23 +113,15 @@ def test_sync_timeout_exposes_recoverable_job_and_supports_idempotency(queue_app
 
         monkeypatch.setattr(app.state.service, "wait", timed_out)
         upload = {"file": ("file.pdf", make_pdf())}
-        response = client.post(
-            "/v2/parse/file", files=upload, headers={"Idempotency-Key": "request-1"}
-        )
+        response = client.post("/v2/parse/file", files=upload)
         assert response.status_code == 504
         job = response.json()
         assert job["statusText"] == "pdfParseFailed"
         assert response.headers["Location"] == job["status_url"]
         assert client.get(job["status_url"]).json()["state"] == "queued"
-        same = client.post("/jobs", files=upload, headers={"Idempotency-Key": "request-1"})
-        assert same.json()["id"] == job["id"]
-        conflict = client.post(
-            "/v2/parse/file",
-            files=upload,
-            data={"image_analysis": "true"},
-            headers={"Idempotency-Key": "request-1"},
-        )
-        assert conflict.status_code == 409
+        assert client.post("/jobs", files=upload).json()["id"] == job["id"]
+        changed = client.post("/jobs", files=upload, data={"image_analysis": "true"})
+        assert changed.status_code == 202 and changed.json()["id"] != job["id"]
 
 
 def test_old_worker_cannot_silently_ignore_options(queue_app):
@@ -263,7 +234,7 @@ def test_worker_retries_transfer_backpressure_without_reparsing(queue_app):
         job = client.post("/jobs", files={"file": ("file.pdf", make_pdf())}).json()
         client.headers["Authorization"] = "Bearer " + config.worker_token
         engine = OptionsEngine()
-        worker = Worker(settings, config, engine=engine, client=client)
+        worker = Worker(settings, config, parse=engine.parse, client=client)
         execute_request = client.request
         completions = []
 
@@ -296,30 +267,31 @@ def test_filtered_empty_markdown_is_a_valid_durable_result(queue_app):
     with TestClient(app) as client:
         job = client.post("/jobs", files={"file": ("file.pdf", make_pdf())}).json()
         client.headers["Authorization"] = "Bearer " + config.worker_token
-        worker = Worker(settings, config, engine=EmptyEngine(), client=client)
+        worker = Worker(settings, config, parse=EmptyEngine().parse, client=client)
         worker.execute(worker.claim())
         response = client.get(job["result_url"])
         assert response.status_code == 200
         assert response.json()["markdown"] == "" and response.json()["pages"] == 1
 
 
-def test_validation_time_is_deducted_from_sync_wait_budget(monkeypatch):
+def test_validation_time_is_deducted_from_sync_wait_budget(queue_app, monkeypatch):
     import time
 
-    app = create_app(Settings(preload_models=False, request_timeout=0.4), engine=OptionsEngine())
+    _, settings, config = queue_app
+    app = create_app(replace(settings, request_timeout=0.4), queue_settings=config)
     captured = []
 
     def validate(_payload, _max_pages):
         time.sleep(0.06)
         return 1
 
-    async def parse(*_args, timeout):
+    async def wait(_job_id, *, timeout):
         captured.append(timeout)
         return ParseOutput("parsed", 1)
 
-    monkeypatch.setattr("app.interfaces.http.parsing.validate_pdf", validate)
+    monkeypatch.setattr("app.http.parsing.validate_pdf", validate)
     with TestClient(app) as client:
-        monkeypatch.setattr(app.state.service, "parse", parse)
+        monkeypatch.setattr(app.state.service, "wait", wait)
         response = client.post("/v2/parse/file", files={"file": ("file.pdf", make_pdf())})
         assert response.status_code == 200
         assert 0 < captured[0] < 0.35

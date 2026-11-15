@@ -1,24 +1,22 @@
 """Exercise the installed MinerU SDK using its native-text flash path."""
 
-from app.infrastructure.mineru.engine import MinerUEngine, markdown_without_images
+from app.models import LEGACY_OPTIONS, ParseOptions
+from app.parser.engine import parse_pdf, warmup
+from app.parser.rendering import render_result
 from scripts.smoke_test import sample_pdf
 
 
 def test_installed_sdk_renders_real_pdf_and_suppresses_images(monkeypatch, tmp_path):
     monkeypatch.setenv("MINERU_HOME", str(tmp_path))
     monkeypatch.setenv("MINERU_MODEL_SOURCE", "local")
-    engine = MinerUEngine("flash")
-    try:
-        engine.warmup()
-        encoded = engine.parse(sample_pdf(), True)
-        plain = engine.parse(sample_pdf(), False)
-        assert encoded.pages == plain.pages == 1
-        assert "verification" in encoded.markdown.lower()
-        assert "verification" in plain.markdown.lower()
-        assert "data:image/" in encoded.markdown
-        assert "data:image/" not in plain.markdown
-    finally:
-        engine.close()
+    warmup("flash")
+    encoded = parse_pdf(sample_pdf(), True, "flash", ParseOptions())
+    plain = parse_pdf(sample_pdf(), False, "flash", ParseOptions())
+    assert encoded.pages == plain.pages == 1
+    assert "verification" in encoded.markdown.lower()
+    assert "verification" in plain.markdown.lower()
+    assert "data:image/" in encoded.markdown
+    assert "data:image/" not in plain.markdown
 
 
 def test_no_image_rendering_handles_table_chart_fallbacks_without_losing_text():
@@ -76,11 +74,10 @@ def test_no_image_rendering_handles_table_chart_fallbacks_without_losing_text():
         )
     )
     encoded = result.markdown()
-    plain = markdown_without_images(result)
+    plain = render_result(result, False, LEGACY_OPTIONS)
     assert "data:image/" in encoded
     assert "data:image/" not in plain
     assert "fallback.png" not in plain
     assert "<img" not in plain.lower()
     for expected in ("Apple", "Pear", "10", "Recognized description", "E=mc^2"):
         assert expected in plain
-    assert result.markdown() == encoded  # Rendering must not mutate the SDK result.
