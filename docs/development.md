@@ -1,6 +1,6 @@
 # 代码结构与本地开发
 
-服务 1.4.0 使用 MinerU 4.0.12、DocVortex 0.6.5、worker 协议 3 和 SQLite schema 4。HTTP 请求统一进入持久队列，API 进程只负责协调与本地文件，GPU 子进程串行执行文档解析。
+服务 1.4.1+mineru.4.2.3 使用 MinerU 4.2.3、DocVortex 0.6.24、worker 协议 3 和 SQLite schema 4。HTTP 请求统一进入持久队列，API 进程只负责协调与本地文件，GPU 子进程串行执行文档解析。
 
 ## 代码入口
 
@@ -32,6 +32,8 @@
 
 ## 本地环境
 
+MinerU 4.2.3 要求 Python 3.11–3.14，建议使用 Python 3.12；升级前重建较旧的 Python 环境。
+
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e '.[test]'
@@ -62,9 +64,10 @@ SQLite 构建工具固定源码与校验和，产物位于 `artifacts/sqlite/`�
 部署配置检查：
 
 ```bash
+python3 scripts/init_env.py
 docker compose config --quiet
-docker compose -f compose.yaml -f compose.scale.yaml config --quiet
-docker compose -f compose.yaml -f compose.scale.yaml -f compose.quad.yaml config --quiet
+COMPOSE_FILE=compose.yaml:compose.scale.yaml docker compose config --quiet
+COMPOSE_FILE=compose.yaml:compose.quad.yaml docker compose config --quiet
 .venv/bin/python scripts/smoke_test.py http://127.0.0.1:3888
 ```
 

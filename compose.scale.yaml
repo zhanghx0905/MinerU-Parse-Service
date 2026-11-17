@@ -1,13 +1,14 @@
-# Optional second GPU parsing unit; use with compose.yaml.
+# Use with compose.yaml. PARSE_WORKERS is the process count on every GPU.
 services:
   mineru-worker-b:
     extends:
       file: compose.yaml
       service: mineru-worker
+    # Declare dependencies explicitly for Compose versions that omit them in extends.
     depends_on:
       mineru-api:
         condition: service_healthy
-      mineru-vlm-b:
+      mineru-vlm-gateway:
         condition: service_healthy
     deploy:
       resources:
@@ -21,6 +22,8 @@ services:
     extends:
       file: compose.yaml
       service: mineru-vlm
+    volumes:
+      - vlm-cache-b:/root/.cache/vllm
     deploy:
       resources:
         reservations:
@@ -35,3 +38,6 @@ services:
     depends_on:
       mineru-vlm-b:
         condition: service_healthy
+
+volumes:
+  vlm-cache-b:

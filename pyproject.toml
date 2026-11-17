@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mineru-pdf-service"
-version = "1.4.0"
-description = "PDF to Markdown API using the public MinerU 4 SDK"
-requires-python = ">=3.10,<3.15"
+version = "1.4.1+mineru.4.2.3"
+description = "PDF to Markdown API using the public MinerU SDK"
+requires-python = ">=3.11,<3.15"
 dependencies = [
-  "mineru==4.0.12",
-  # Match the native PDF text interface used by MinerU 4.0.12.
-  "docvortex==0.6.5",
+  "mineru==4.2.3",
+  # Match the native PDF text interface used by MinerU 4.2.3.
+  "docvortex==0.6.24",
   "fastapi>=0.121.3,<1",
   "uvicorn>=0.38,<1",
   "python-multipart>=0.0.20,<1",
@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["mineru[torch]==4.0.12"]
+gpu = ["mineru[torch]==4.2.3"]
 test = ["pytest>=8,<10", "ruff>=0.14,<1"]
 
 [tool.setuptools.packages.find]

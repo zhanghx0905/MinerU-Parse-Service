@@ -1,28 +1,70 @@
-# Four GPU units: 8 independent processes per GPU, 2 reserved for priority=1.
-# Use with compose.yaml and compose.scale.yaml, one container per worker service.
+# Use with compose.yaml. PARSE_WORKERS is the process count on every GPU.
 services:
+  # Reserve one priority-only process on each of the first two GPUs.
   mineru-worker:
     environment:
-      PARSE_WORKERS: ${WORKERS_PER_GPU:-8}
       PRIORITY_WORKERS: 1
 
   mineru-worker-b:
+    extends:
+      file: compose.yaml
+      service: mineru-worker
+    # Declare dependencies explicitly for Compose versions that omit them in extends.
+    depends_on:
+      mineru-api:
+        condition: service_healthy
+      mineru-vlm-gateway:
+        condition: service_healthy
     environment:
-      PARSE_WORKERS: ${WORKERS_PER_GPU:-8}
       PRIORITY_WORKERS: 1
+    deploy:
+      resources:
+        reservations:
+          devices: !override
+            - driver: nvidia
+              device_ids: ["${GPU_ID_B:-1}"]
+              capabilities: [gpu]
+
+  mineru-vlm-b:
+    extends:
+      file: compose.yaml
+      service: mineru-vlm
+    volumes:
+      - vlm-cache-b:/root/.cache/vllm
+    deploy:
+      resources:
+        reservations:
+          devices: !override
+            - driver: nvidia
+              device_ids: ["${GPU_ID_B:-1}"]
+              capabilities: [gpu]
 
   mineru-worker-c:
     extends:
       file: compose.yaml
       service: mineru-worker
-    environment:
-      PARSE_WORKERS: ${WORKERS_PER_GPU:-8}
-      PRIORITY_WORKERS: 0
+    # Declare dependencies explicitly for Compose versions that omit them in extends.
     depends_on:
       mineru-api:
         condition: service_healthy
-      mineru-vlm-c:
+      mineru-vlm-gateway:
         condition: service_healthy
+    environment:
+      PRIORITY_WORKERS: 0
+    deploy:
+      resources:
+        reservations:
+          devices: !override
+            - driver: nvidia
+              device_ids: ["${GPU_ID_C:-2}"]
+              capabilities: [gpu]
+
+  mineru-vlm-c:
+    extends:
+      file: compose.yaml
+      service: mineru-vlm
+    volumes:
+      - vlm-cache-c:/root/.cache/vllm
     deploy:
       resources:
         reservations:
@@ -35,14 +77,14 @@ services:
     extends:
       file: compose.yaml
       service: mineru-worker
-    environment:
-      PARSE_WORKERS: ${WORKERS_PER_GPU:-8}
-      PRIORITY_WORKERS: 0
+    # Declare dependencies explicitly for Compose versions that omit them in extends.
     depends_on:
       mineru-api:
         condition: service_healthy
-      mineru-vlm-d:
+      mineru-vlm-gateway:
         condition: service_healthy
+    environment:
+      PRIORITY_WORKERS: 0
     deploy:
       resources:
         reservations:
@@ -51,22 +93,12 @@ services:
               device_ids: ["${GPU_ID_D:-3}"]
               capabilities: [gpu]
 
-  mineru-vlm-c:
-    extends:
-      file: compose.yaml
-      service: mineru-vlm
-    deploy:
-      resources:
-        reservations:
-          devices: !override
-            - driver: nvidia
-              device_ids: ["${GPU_ID_C:-2}"]
-              capabilities: [gpu]
-
   mineru-vlm-d:
     extends:
       file: compose.yaml
       service: mineru-vlm
+    volumes:
+      - vlm-cache-d:/root/.cache/vllm
     deploy:
       resources:
         reservations:
@@ -79,7 +111,14 @@ services:
     environment:
       VLM_UPSTREAMS: http://mineru-vlm:8000,http://mineru-vlm-b:8000,http://mineru-vlm-c:8000,http://mineru-vlm-d:8000
     depends_on:
+      mineru-vlm-b:
+        condition: service_healthy
       mineru-vlm-c:
         condition: service_healthy
       mineru-vlm-d:
         condition: service_healthy
+
+volumes:
+  vlm-cache-b:
+  vlm-cache-c:
+  vlm-cache-d:

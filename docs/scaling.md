@@ -4,11 +4,11 @@
 
 ## 部署拓扑
 
-| 模式 | Compose 文件 | worker / vLLM 容器 | 默认解析进程 / VIP |
+| 模式 | `.env` 中的 `COMPOSE_FILE` | worker / vLLM 容器 | 总解析进程 / VIP（`PARSE_WORKERS=2`） |
 | --- | --- | --- | --- |
 | 单卡 | `compose.yaml` | 1 / 1 | 2 / 0 |
-| 双卡 | 再加 `compose.scale.yaml` | 2 / 2 | 4 / 0 |
-| 四卡 | 再加 `compose.quad.yaml` | 4 / 4 | 32 / 2 |
+| 双卡 | `compose.yaml:compose.scale.yaml` | 2 / 2 | 4 / 0 |
+| 四卡 | `compose.yaml:compose.quad.yaml` | 4 / 4 | 8 / 2 |
 
 所有模式另有 1 个 CPU API 和 1 个 VLM 网关。每个 worker 容器启动一个轻量监督进程，再用 `spawn` 启动解析子进程；每个子进程同时处理一份 PDF，独立持有本地模型和 SDK 锁。vLLM 服务按 GPU 运行，由这些解析进程共享。
 
@@ -18,34 +18,35 @@ SQLite 和本地对象目录只由唯一的 API 进程访问。启动第二个 A
 
 ```bash
 python3 scripts/init_env.py
-# 编辑 .env，设置 GPU、端口、业务凭据等。已有配置不会被脚本改写。
+# 按注释编辑 .env；初始化会保留已有覆盖值和密钥，并同步镜像版本标签。
 docker compose build
 docker compose run --rm --no-deps --entrypoint mineru-kit mineru-worker \
   models download --tier standard --small-backend torch --vlm-engine vllm -s modelscope
 docker compose up -d
 ```
 
-四卡启动与检查：
+四卡示例：在 `.env` 设置 `COMPOSE_FILE=compose.yaml:compose.quad.yaml` 和 `PARSE_WORKERS=6`，共 24 个解析进程（22 通用 + 2 VIP）：
 
 ```bash
-docker compose -f compose.yaml -f compose.scale.yaml -f compose.quad.yaml build
-docker compose -f compose.yaml -f compose.scale.yaml -f compose.quad.yaml up -d
-docker compose -f compose.yaml -f compose.scale.yaml -f compose.quad.yaml ps
+docker compose build
+docker compose up -d
+docker compose ps
 ```
 
-使用同一组 `-f` 参数执行启动、配置检查和维护。四卡模式每个 worker 服务保持一个容器；额外使用 `--scale` 会同时放大解析进程数和 VIP 数。
+拓扑由 `.env` 选择，启动、检查、备份和维护都直接使用 `docker compose`。四卡模式每个 worker 服务保持一个容器；额外使用 `--scale` 会同时放大解析进程数和 VIP 数。
 
 ## 配置
 
-配置只在进程启动时从环境变量读取，Compose 从 `.env` 注入。数据库保存任务和实际占用，不保存容量上限。修改 `.env` 后执行对应 Compose 配置的 `up -d` 重建受影响服务；`restart` 不会重新注入环境变量。
+配置只在进程启动时从环境变量读取。API 和 worker 通过 Compose `env_file` 直接读取 `.env`；未设置的应用参数使用代码默认值，不再在 Compose 和 `.env` 中重复维护。网关只接收其路由配置，不读取业务和 worker 凭据。Compose 保留连接地址、容器内路径、GPU 和网关设置。
+
+`.env.example` 只启用 7 个常用或自动生成的配置，其余部署选项提供注释示例；容量与超时无需逐项抄入 `.env`。需要调整时按下表添加覆盖，并写明调整原因。应用覆盖请写入 `.env`，不会自动透传未写入文件的 shell 环境变量。使用其他配置路径时设置 `ENV_FILE=/absolute/path/to/config.env`，并同时传 `docker compose --env-file /absolute/path/to/config.env …`，让插值和容器注入使用同一文件。数据库保存任务和实际占用，不保存容量上限。修改 `.env` 后执行对应 Compose 配置的 `up -d` 重建受影响服务；`restart` 不会重新注入环境变量。
 
 ### 解析与 GPU
 
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
 | `GPU_ID` / `GPU_ID_B` / `GPU_ID_C` / `GPU_ID_D` | 0 / 1 / 2 / 3 | GPU 设备编号 |
-| `PARSE_WORKERS` | 2 | 单卡、双卡模式每个 worker 容器的解析进程数 |
-| `WORKERS_PER_GPU` | 8 | 四卡模式覆盖每卡解析进程数 |
+| `PARSE_WORKERS` | 2 | 所有拓扑中每张 GPU 的解析进程数，包含 VIP；总数 = GPU 数 × 此值 |
 | `PRIORITY_WORKERS` | 0 | 单卡、双卡模式每容器的高优专用进程数，包含在 `PARSE_WORKERS` 中 |
 | `PARSE_TIER` | standard | 默认解析档位 |
 | `PRELOAD_MODELS` | true | 各解析子进程启动后先预热 |
@@ -55,8 +56,9 @@ docker compose -f compose.yaml -f compose.scale.yaml -f compose.quad.yaml ps
 | `MODEL_REVISION` | MinerU2.5-Pro-2605-1.2B | 参与指纹与 worker 校验的模型标识 |
 | `VLLM_IMAGE` | vllm/vllm-openai:v0.29.0 | GPU 基础与推理镜像 |
 | `MINERU_MODEL_SOURCE` / `SMALL_BACKEND` | modelscope / torch | 模型来源与本地模型后端 |
+| `CUDA_LIBRARY_PATH` / `VLLM_ENABLE_CUDA_COMPATIBILITY` | 标准 CUDA/NVIDIA 库路径 / 0 | 旧驱动主机经验证后显式配置兼容库路径和开关；无需另外叠加兼容 Compose 文件 |
 
-四卡配置的高优专用进程数固定为 1/1/0/0。默认每卡 8 个进程，共 30 个通用进程和 2 个 VIP；改变 `WORKERS_PER_GPU` 不改变 VIP 总数。通用进程先领高优再领普通，高优专用进程没有高优任务时空闲，不中断正在执行的普通任务。
+四卡配置的高优专用进程数固定为 1/1/0/0。例如 `PARSE_WORKERS=6` 时每卡 6 个进程，共 22 个通用进程和 2 个 VIP；改变 `PARSE_WORKERS` 不改变 VIP 总数。通用进程先领高优再领普通，高优专用进程没有高优任务时空闲，不中断正在执行的普通任务。
 
 增加进程会增加模型副本、内存、显存和请求并发。根据实际吞吐、排队和显存峰值调整；并发进程数不等于吞吐倍数。当前 API 和 worker 的 `/tmp` 使用容器磁盘及 Linux 页缓存，避免固定容量内存盘在并发渲染位图时耗尽。
 
@@ -94,9 +96,19 @@ Compose 的 `QUEUE_DATABASE` 为 `/data/queue.sqlite3`，`OBJECT_DIR` 为 `/data
 
 ## 更新与停止
 
-代码更新先构建镜像，再重建 API 和 worker。配置更新仅重建受影响服务。长文档维护前先暂停上游新提交，等待 queued / running 归零；worker 默认停止宽限为 120 秒，API 为 30 秒，必要时通过 Compose `stop --timeout` 延长。
+代码更新先执行 `python3 scripts/init_env.py` 同步镜像标签，再构建镜像并重建 API 和 worker。项目版本以 `pyproject.toml` 为准，格式为 `1.4.1+mineru.4.2.3`；`SERVICE_VERSION` 自动将 `+` 转为 `-` 用于 Docker 标签。需要固定外部镜像或摘要时仍可设置 `API_IMAGE`、`WORKER_IMAGE`；这两项会优先于生成的标签。
+
+Compose 项目名决定数据卷名称，已有部署必须保留 `COMPOSE_PROJECT_NAME` 或原有 `-p` 值。每个 vLLM 副本使用独立的持久编译缓存卷。
+
+配置更新仅重建受影响服务。长文档维护前先暂停上游新提交，等待 queued / running 归零；worker 默认停止宽限为 120 秒，API 为 30 秒，必要时通过 Compose `stop --timeout` 延长。
 
 监督进程收到停止信号后通知所有解析子进程，让它们完成当前文档再退出。超过停止宽限会被终止，未完成任务依靠租约恢复。信号与领取有并发窗口，当前没有全局排空或取消接口。
+
+### 部署配置迁移
+
+旧四卡部署将 `.env` 的 `COMPOSE_FILE` 改为 `compose.yaml:compose.quad.yaml`，不再叠加 `compose.scale.yaml`；将原来生效的 `WORKERS_PER_GPU` 值迁到 `PARSE_WORKERS` 并删除旧变量。初始化脚本会在 `COMPOSE_FILE` 已选择四卡时完成这次合并，其余拓扑保留 `PARSE_WORKERS`。旧四卡未配置进程数时有效默认是 8；要保持原容量，迁移时显式设置 `PARSE_WORKERS=8`。
+
+将必要的镜像源、模型目录、CUDA 兼容设置放回 `.env`，删除仅用于这些覆盖的发布/兼容 Compose 文件。保留业务凭据、项目名、GPU 分配和非默认租约设置；容量与超时等默认项可删除。切换 vLLM 缓存卷会重新编译，也可先把原缓存复制到对应卷。
 
 ### 旧版本升级
 
@@ -117,7 +129,7 @@ docker compose exec mineru-api python -m app.queue.database \
   --database /data/queue.sqlite3 /data/backup.sqlite3
 ```
 
-四卡部署使用相同三份 Compose 文件执行该命令。备份命令只包含 SQLite，不包含 PDF、Markdown、模型或凭据；不要单独复制正在变化的数据库主文件。
+四卡部署也直接使用该命令，Compose 自动读取 `.env` 中的拓扑。备份命令只包含 SQLite，不包含 PDF、Markdown、模型或凭据；不要单独复制正在变化的数据库主文件。
 
 需要联合恢复点时，暂停提交并排空任务，停止全部 worker 和 API，再在维护容器中运行相同备份命令，并复制关联对象。停机备份示例：
 

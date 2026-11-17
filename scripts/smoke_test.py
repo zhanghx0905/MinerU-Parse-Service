@@ -63,7 +63,7 @@ def main():
     ) as client:
         health = client.get("/health")
         health.raise_for_status()
-        assert health.json()["mineru_version"] == "4.0.12", health.text
+        assert health.json()["mineru_version"] == "4.2.3", health.text
         results = []
         for encode_img in (True, True, False):
             started = time.perf_counter()
